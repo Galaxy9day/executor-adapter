@@ -1,0 +1,52 @@
+{
+  "name": "@galaxy9day/pi-adapter",
+  "version": "0.1.0",
+  "description": "Pi (GPT-5.5) executor adapter MCP for Trellis Phase 2.1 and standalone use. Acts as a Trellis channel adapter (parallel to claude.ts/codex.ts) when trellis channel is active; otherwise runs Pi as a subprocess with auto-validation.",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "pi-adapter": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "smoke": "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\\n' | node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@iarna/toml": "^2.2.5",
+    "@mindfoldhq/trellis-core": "^0.6.0-beta.13"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "pi",
+    "pi-coder",
+    "trellis",
+    "channel-adapter",
+    "ai-agent",
+    "executor",
+    "anthropic"
+  ],
+  "author": "galaxy9day (https://github.com/Galaxy9day)",
+  "license": "AGPL-3.0-only",
+  "homepage": "https://github.com/Galaxy9day/pi-adapter#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Galaxy9day/pi-adapter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Galaxy9day/pi-adapter/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

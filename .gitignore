@@ -1,0 +1,11 @@
+node_modules/
+*.log
+*.tgz
+.DS_Store
+.env
+.env.*
+.npmrc
+coverage/
+.nyc_output/
+.vscode/
+.idea/
