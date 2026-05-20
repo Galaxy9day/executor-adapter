@@ -13,6 +13,8 @@ Acts as a **Trellis channel adapter** (parallel to the built-in `claude.ts` and 
 
 - Reads Trellis task artifacts (`prd.md`, `design.md`, `implement.md`, `implement.jsonl` / `check.jsonl`) and assembles a Pi-ready prompt.
 - Spawns Pi with sanitised environment (credential-shaped vars are stripped before inheritance).
+- Defaults implementation/custom dispatches to an isolated git worktree under `.trellis/.runtime/pi-workers/<worker-id>/`, then exports `diff.patch` and `report.json` for the orchestrator to review/apply.
+- Defaults check dispatches to read-only review mode (`read,grep,find,ls`) so Pi can supplement quality review without mutating the repo.
 - In channel mode: emits bookend events into the Trellis channel via `@mindfoldhq/trellis-core`'s `sendMessage`, so the audit trail belongs to Trellis core.
 - Runs post-execution validation against `git diff` (`min_files_changed`, `required_paths_modified`, `forbidden_paths`, `min_diff_lines`) — catches "exit 0 + no useful work" failures before the orchestrator sees them.
 - Resolves Pi model names from `~/.pi/config.toml` so you never hard-code a model into your scripts.
@@ -79,7 +81,9 @@ Assemble context, run Pi, optionally emit channel events, run post-validation, r
 | `working_directory` | string | Repo root; defaults to CWD. |
 | `model` | string | Logical name (`implementer` / `reviewer` / custom key) or fully qualified route. |
 | `thinking` | string | Pi thinking level. Default `high`. |
-| `tools` | string | Comma-separated tool list for Pi. Default `read,bash,edit,write,grep,find,ls`. |
+| `execution_mode` | string | `review`, `patch`, `worktree`, or `direct`. Defaults to `worktree` for `implement/custom`, `review` for `check`. |
+| `isolate_pi` | boolean | Default `true`: disables Pi extensions/skills/prompt templates/context files/session persistence and uses a per-worker Pi home. |
+| `tools` | string | Comma-separated tool list for Pi. Defaults by `execution_mode`: `review=read,grep,find,ls`, `patch=read,bash,grep,find,ls`, `worktree/direct=read,bash,edit,write,grep,find,ls`. |
 | `timeout_minutes` | number | Default 60, hard-capped at 120. |
 | `dry_run` | boolean | Build prompt without launching Pi. |
 | `extra_instructions` | string | Additional prompt text appended after assembled context. |
@@ -90,6 +94,15 @@ Assemble context, run Pi, optionally emit channel events, run post-validation, r
 | `required_paths_modified` | string[] | Post-validation: fail if any listed path NOT in diff. |
 | `forbidden_paths` | string[] | Post-validation: fail if any listed path IS in diff (trailing `/` matches dir prefix). |
 | `min_diff_lines` | number | Post-validation: fail if total ins+del < N. |
+
+#### Execution modes
+
+- `worktree` (default for implementation): creates `.trellis/.runtime/pi-workers/<worker-id>/repo` from `HEAD`, runs Pi there with an isolated `PI_CODING_AGENT_DIR`, writes `output.log`, `report.json`, and `diff.patch`, and returns an `apply_command` (`git apply "<patch>"`). The main repository is not modified by Pi.
+- `review` (default for check): runs read-only with `read,grep,find,ls` and reports findings. Use this for cross-model review.
+- `patch`: asks Pi to produce a unified diff in its final answer without direct edits.
+- `direct`: legacy in-place execution in the target repository. Use only when the orchestrator explicitly wants Pi to write directly and the environment supports it.
+
+`worktree` prompts embed Trellis manifest files and task artifacts so Pi can run from a clean checkout even when task files are uncommitted in the main worktree.
 
 ### `preview_prompt(...)`
 
@@ -122,7 +135,7 @@ When `.trellis/` isn't present, the main orchestrator agent (Claude Code / Codex
 
 - The skill exposes its tools; the orchestrator decides when to call them
 - `dispatch` requires `extra_instructions` in `custom` mode
-- Runtime files go to `/tmp/pi-adapter/` instead of `.trellis/.runtime/`
+- Runtime files go to `/tmp/pi-adapter/pi-workers/<worker-id>/` instead of `.trellis/.runtime/pi-workers/<worker-id>/`
 - A fingerprint lock keyed on `(scope, extra_instructions)` prevents accidental concurrent identical dispatches
 
 ## Forward compatibility

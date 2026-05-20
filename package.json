@@ -1,6 +1,6 @@
 {
   "name": "@galaxy9day/pi-adapter",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi (GPT-5.5) executor adapter MCP for Trellis Phase 2.1 and standalone use. Acts as a Trellis channel adapter (parallel to claude.ts/codex.ts) when trellis channel is active; otherwise runs Pi as a subprocess with auto-validation.",
   "type": "module",
   "main": "index.js",
@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "smoke": "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\\n' | node index.js"
+    "smoke": "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"pi-adapter-smoke\",\"version\":\"0.0.0\"}}}\\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\\n' | node index.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

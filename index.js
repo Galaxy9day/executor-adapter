@@ -33,7 +33,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import TOML from '@iarna/toml';
-import { spawn, execSync } from 'node:child_process';
+import { spawn, execSync, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -42,11 +42,14 @@ import * as crypto from 'node:crypto';
 // ---- Constants ----
 
 const SERVER_NAME = 'pi-adapter';
-const SERVER_VERSION = '0.1.0';  // keep in sync with package.json
+const SERVER_VERSION = '0.1.1';  // keep in sync with package.json
 const TMP_RUNTIME_DIR = path.join(os.tmpdir(), SERVER_NAME);
 const CHANNEL_ENV_ALIASES = ['TRELLIS_CHANNEL', 'TRELLIS_CHANNEL_NAME'];
 const TRELLIS_BIN_ENV = 'TRELLIS_BINARY';
 const PI_BIN_ENV = 'PI_BINARY';
+const DEFAULT_WRITE_TOOLS = 'read,bash,edit,write,grep,find,ls';
+const DEFAULT_READ_TOOLS = 'read,grep,find,ls';
+const DEFAULT_PATCH_TOOLS = 'read,bash,grep,find,ls';
 
 // ---- Small utilities ----
 
@@ -71,6 +74,20 @@ function resolveRuntimeDir(workDir) {
     return path.join(workDir, '.trellis', '.runtime');
   }
   return TMP_RUNTIME_DIR;
+}
+
+function isGitRepo(workDir) {
+  try {
+    execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: workDir,
+      encoding: 'utf-8',
+      timeout: 10000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---- Binary discovery (cached) ----
@@ -355,8 +372,13 @@ function assembleTrellisContext(repoRoot, taskDir, mode) {
 
 // ---- Prompt builders ----
 
+function fencedContent(label, content) {
+  return `### ${label}\n\n~~~text\n${String(content || '')}\n~~~\n\n`;
+}
+
 function buildDispatchPrompt(args) {
   const { taskDir, artifacts, manifest, manifestFile, mode } = args;
+  const executionMode = args.execution_mode || defaultExecutionMode(mode);
   const extraInstructions = args.extra_instructions || '';
   const scopeConstraint = args.scope || '';
   const validationCommands = args.validation_commands || [];
@@ -382,8 +404,22 @@ function buildDispatchPrompt(args) {
   if (artifacts['design.md'])    p += `${idx++}. \`${taskDir}/design.md\` — technical design.\n`;
   if (artifacts['implement.md']) p += `${idx++}. \`${taskDir}/implement.md\` — execution plan.\n`;
 
+  if (manifest.files.length > 0 || Object.keys(artifacts).length > 0) {
+    p += `\n## Embedded Trellis Context\n\n`;
+    p += `These are embedded so isolated Pi workers can run from a clean worktree without depending on uncommitted task files.\n\n`;
+    for (const f of manifest.files) p += fencedContent(f.path, f.content);
+    for (const [name, content] of Object.entries(artifacts)) p += fencedContent(`${taskDir}/${name}`, content);
+  }
+
   if (scopeConstraint)        p += `\n## Scope Constraint\n\n${scopeConstraint}\n\n`;
   if (extraInstructions)      p += `\n## Additional Instructions\n\n${extraInstructions}\n\n`;
+  if (executionMode === 'worktree') {
+    p += `\n## Execution Environment\n\nYou are running inside an isolated git worktree. Modify files there normally. The orchestrator will export your changes as a patch, review it, and decide whether to apply it to the main repository. Do not commit.\n\n`;
+  } else if (executionMode === 'patch') {
+    p += `\n## Execution Environment\n\nDo not edit files directly. Produce a unified diff in your final answer that the orchestrator can review and apply.\n\n`;
+  } else if (executionMode === 'review') {
+    p += `\n## Execution Environment\n\nRead-only review mode. Do not modify files. Report findings and recommended fixes only.\n\n`;
+  }
   if (validationCommands.length > 0) {
     p += `\n## Verification Commands\n\nRun these before reporting done:\n\n`;
     for (const cmd of validationCommands) p += `\`\`\`bash\n${cmd}\n\`\`\`\n\n`;
@@ -392,16 +428,25 @@ function buildDispatchPrompt(args) {
   return p;
 }
 
-function buildNoTrellisPrompt(mode, extraInstructions, scope, validationCommands) {
-  const modeLabel = mode === 'check' ? 'Quality Check' : 'Implementation';
+function buildNoTrellisPrompt(mode, extraInstructions, scope, validationCommands, executionMode = defaultExecutionMode(mode)) {
+  const modeLabel = mode === 'check' ? 'Quality Check' : mode === 'custom' ? 'Custom' : 'Implementation';
   let p = `# Pi Dispatch: ${modeLabel} (no Trellis)\n\n`;
   if (mode === 'implement') {
     p += `You are the implementation executor. The main Agent will review your output.\n\n**Guards**:\n- Do NOT git commit.\n- Do NOT spawn other agents.\n\n`;
   } else if (mode === 'check') {
     p += `You are the quality check executor. Review all code changes. Fix issues directly.\n\n**Guards**:\n- Do NOT git commit.\n- Do NOT spawn other agents.\n\n`;
+  } else if (mode === 'custom') {
+    p += `You are a Pi worker. The orchestrator will review your output.\n\n**Guards**:\n- Do NOT git commit.\n- Do NOT spawn other agents.\n\n`;
   }
   p += `## Task\n\n${extraInstructions}\n\n`;
   if (scope) p += `## Scope Constraint\n\n${scope}\n\n`;
+  if (executionMode === 'worktree') {
+    p += `## Execution Environment\n\nYou are running inside an isolated git worktree. Modify files there normally. The orchestrator will export your changes as a patch, review it, and decide whether to apply it to the main repository. Do not commit.\n\n`;
+  } else if (executionMode === 'patch') {
+    p += `## Execution Environment\n\nDo not edit files directly. Produce a unified diff in your final answer that the orchestrator can review and apply.\n\n`;
+  } else if (executionMode === 'review') {
+    p += `## Execution Environment\n\nRead-only review mode. Do not modify files. Report findings and recommended fixes only.\n\n`;
+  }
   if (validationCommands && validationCommands.length > 0) {
     p += `## Verification Commands\n\n`;
     for (const cmd of validationCommands) p += `\`\`\`bash\n${cmd}\n\`\`\`\n\n`;
@@ -491,6 +536,102 @@ function makeHeadTailBuffer(headCap = 10 * 1024, tailCap = 40 * 1024) {
   };
 }
 
+function defaultExecutionMode(mode) {
+  return mode === 'check' ? 'review' : 'worktree';
+}
+
+function defaultToolsForExecution(executionMode) {
+  if (executionMode === 'review') return DEFAULT_READ_TOOLS;
+  if (executionMode === 'patch') return DEFAULT_PATCH_TOOLS;
+  return DEFAULT_WRITE_TOOLS;
+}
+
+function makeWorkerId(mode, taskDir, scope, extraInstructions) {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const fp = crypto
+    .createHash('sha256')
+    .update(`${mode}|${taskDir || ''}|${scope || ''}|${extraInstructions || ''}|${process.pid}|${Date.now()}`)
+    .digest('hex')
+    .slice(0, 8);
+  return `pi-${mode}-${ts}-${fp}`;
+}
+
+function createWorkerRuntime(runtimeDir, workerId) {
+  const workerDir = path.join(runtimeDir, 'pi-workers', workerId);
+  const repoDir = path.join(workerDir, 'repo');
+  const piHome = path.join(workerDir, 'pi-home');
+  const sessionDir = path.join(workerDir, 'sessions');
+  fs.mkdirSync(piHome, { recursive: true });
+  fs.mkdirSync(sessionDir, { recursive: true });
+  return { workerId, workerDir, repoDir, piHome, sessionDir };
+}
+
+function createWorktree(sourceDir, repoDir) {
+  fs.mkdirSync(path.dirname(repoDir), { recursive: true });
+  execFileSync('git', ['worktree', 'add', '--detach', repoDir, 'HEAD'], {
+    cwd: sourceDir,
+    encoding: 'utf-8',
+    timeout: 60000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+function prepareWorkerDiff(repoDir, patchFile) {
+  let changedFiles = [];
+  let shortstat = '';
+  let patch = '';
+  try {
+    // Intent-to-add makes newly created files appear in `git diff` without
+    // permanently staging content in the main repository.
+    execFileSync('git', ['add', '-N', '.'], {
+      cwd: repoDir,
+      encoding: 'utf-8',
+      timeout: 10000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {}
+
+  try {
+    const names = execFileSync('git', ['diff', '--name-only', 'HEAD'], {
+      cwd: repoDir,
+      encoding: 'utf-8',
+      timeout: 10000,
+      maxBuffer: 10 * 1024 * 1024,
+    }).trim();
+    changedFiles = names ? names.split('\n') : [];
+    shortstat = execFileSync('git', ['diff', '--shortstat', 'HEAD'], {
+      cwd: repoDir,
+      encoding: 'utf-8',
+      timeout: 10000,
+      maxBuffer: 10 * 1024 * 1024,
+    }).trim();
+    patch = execFileSync('git', ['diff', '--binary', 'HEAD'], {
+      cwd: repoDir,
+      encoding: 'utf-8',
+      timeout: 30000,
+      maxBuffer: 100 * 1024 * 1024,
+    });
+    fs.writeFileSync(patchFile, patch, 'utf-8');
+  } catch (e) {
+    return { ok: false, error: e.message, changedFiles, shortstat, patchFile };
+  }
+  return { ok: true, changedFiles, shortstat, patchFile, bytes: Buffer.byteLength(patch) };
+}
+
+function classifyRunStatus(exitCode, killed, output) {
+  if (killed) return 'timeout';
+  const text = output || '';
+  const approvalBlocked =
+    /approval|approve|permission|confirm|non[- ]interactive|no ui|stdin|tty/i.test(text) &&
+    /blocked|required|waiting|denied|refused|unavailable|cannot|can't|failed/i.test(text);
+  if (approvalBlocked) return 'blocked';
+  return exitCode === 0 ? 'done' : 'failed';
+}
+
+function writeJsonFile(filePath, data) {
+  fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`, 'utf-8');
+}
+
 // ---- Tool implementations ----
 
 async function dispatch(args) {
@@ -500,7 +641,9 @@ async function dispatch(args) {
     working_directory: cwd,
     model: modelInput,
     thinking = 'high',
-    tools = 'read,bash,edit,write,grep,find,ls',
+    tools: toolsInput,
+    execution_mode: executionModeInput,
+    isolate_pi = true,
     timeout_minutes: timeoutInput = 60,
     dry_run = false,
     extra_instructions,
@@ -514,6 +657,14 @@ async function dispatch(args) {
 
   const timeout_minutes = Math.min(timeoutInput, 120);
   const workDir = cwd || process.cwd();
+  const executionMode = executionModeInput || defaultExecutionMode(mode);
+  const tools = toolsInput || defaultToolsForExecution(executionMode);
+  if (!['review', 'patch', 'worktree', 'direct'].includes(executionMode)) {
+    return { content: [{ type: 'text', text: `Error: unsupported execution_mode "${executionMode}". Use review, patch, worktree, or direct.` }], isError: true };
+  }
+  if (executionMode === 'worktree' && !isGitRepo(workDir)) {
+    return { content: [{ type: 'text', text: `Error: execution_mode=worktree requires a git repository: ${workDir}` }], isError: true };
+  }
   const channelName = detectChannel(args, process.env);
   let model, modelFrom, modelKey;
   try {
@@ -541,10 +692,10 @@ async function dispatch(args) {
   let promptBody = '';
   if (taskDir) {
     context = assembleTrellisContext(workDir, taskDir, mode);
-    promptBody = buildDispatchPrompt({ ...context, mode, extra_instructions, scope, validation_commands });
+    promptBody = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands });
   } else if (mode === 'custom') {
     if (!extra_instructions) return { content: [{ type: 'text', text: 'Error: custom mode requires extra_instructions.' }], isError: true };
-    promptBody = extra_instructions;
+    promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode);
   } else {
     if (!extra_instructions) {
       return {
@@ -552,15 +703,18 @@ async function dispatch(args) {
         isError: true,
       };
     }
-    promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands);
+    promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode);
   }
 
   const runtimeDir = resolveRuntimeDir(workDir);
   fs.mkdirSync(runtimeDir, { recursive: true });
 
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const promptPath = path.join(runtimeDir, `pi-${mode}-${ts}-prompt.md`);
-  const logPath = path.join(runtimeDir, `pi-${mode}-${ts}-output.log`);
+  const workerId = makeWorkerId(mode, taskDir, scope, extra_instructions);
+  const worker = createWorkerRuntime(runtimeDir, workerId);
+  const promptPath = path.join(worker.workerDir, 'prompt.md');
+  const logPath = path.join(worker.workerDir, 'output.log');
+  const reportPath = path.join(worker.workerDir, 'report.json');
+  const patchPath = path.join(worker.workerDir, 'diff.patch');
   fs.writeFileSync(promptPath, promptBody, 'utf-8');
 
   let metaResponse = `Resolved task: ${taskDir || '(custom mode)'}\n`;
@@ -574,7 +728,14 @@ async function dispatch(args) {
   }
   metaResponse += `Prompt: ${promptPath}\n`;
   metaResponse += `Log: ${logPath}\n`;
+  metaResponse += `Report: ${reportPath}\n`;
+  metaResponse += `Worker: ${workerId} (${executionMode})\n`;
+  if (executionMode === 'worktree') {
+    metaResponse += `Worker repo: ${worker.repoDir}\n`;
+    metaResponse += `Patch: ${patchPath}\n`;
+  }
   metaResponse += `Model: ${model} (${modelFrom}${modelKey ? `:${modelKey}` : ''}, thinking: ${thinking})\n`;
+  metaResponse += `Tools: ${tools}\n`;
   metaResponse += `Timeout: ${timeout_minutes} min\n`;
   metaResponse += `Channel: ${channelName || '(none, local mode)'}\n`;
 
@@ -610,9 +771,34 @@ async function dispatch(args) {
     }
   }
 
+  let piWorkDir = workDir;
+  if (executionMode === 'worktree') {
+    try {
+      createWorktree(workDir, worker.repoDir);
+      piWorkDir = worker.repoDir;
+    } catch (e) {
+      if (lockPath) releaseDispatchLock(lockPath);
+      const message = `${metaResponse}\nError creating isolated git worktree: ${e.message}`;
+      writeJsonFile(reportPath, {
+        worker_id: workerId,
+        status: 'spawn_error',
+        error: e.message,
+        execution_mode: executionMode,
+        prompt_file: promptPath,
+        log_file: logPath,
+        report_file: reportPath,
+        patch_file: null,
+        finished_at: new Date().toISOString(),
+      });
+      return { content: [{ type: 'text', text: message }], isError: true };
+    }
+  }
+
   await emitChannelEvent(channelName, 'dispatch_start', {
     mode, task: taskDir, scope: scope || null, model,
+    worker_id: workerId, execution_mode: executionMode,
     prompt_file: promptPath, log_file: logPath,
+    report_file: reportPath, patch_file: executionMode === 'worktree' ? patchPath : null,
     started_at: new Date().toISOString(),
   }, workDir);
 
@@ -621,6 +807,13 @@ async function dispatch(args) {
       '--model', model,
       '--tools', tools,
       '--thinking', thinking,
+      ...(isolate_pi ? [
+        '--no-extensions',
+        '--no-skills',
+        '--no-prompt-templates',
+        '--no-context-files',
+        '--no-session',
+      ] : []),
       `@${promptPath}`,
       '-p', 'Follow the instructions in the attached file. Read the listed files in order before writing any code.',
     ];
@@ -631,8 +824,14 @@ async function dispatch(args) {
     const stderrBuf = makeHeadTailBuffer(2 * 1024, 8 * 1024);
 
     const proc = spawn(piBin, piArgs, {
-      cwd: workDir,
-      env: piEnv,
+      cwd: piWorkDir,
+      env: {
+        ...piEnv,
+        PI_CODING_AGENT_DIR: worker.piHome,
+        PI_CODING_AGENT_SESSION_DIR: worker.sessionDir,
+        PI_OFFLINE: '1',
+        PI_SKIP_VERSION_CHECK: '1',
+      },
       // Pi's -p mode blocks on stdin EOF if stdin is a live pipe.
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -656,19 +855,14 @@ async function dispatch(args) {
       if (lockPath) releaseDispatchLock(lockPath);
 
       const exitCode = code || 0;
-      const validation = runPostValidation(workDir, {
+      let diffInfo = null;
+      if (executionMode === 'worktree') {
+        diffInfo = prepareWorkerDiff(worker.repoDir, patchPath);
+      }
+
+      const validation = runPostValidation(piWorkDir, {
         min_files_changed, required_paths_modified, forbidden_paths, min_diff_lines,
       });
-
-      const ok = exitCode === 0 && validation.passed && !killed;
-      await emitChannelEvent(channelName, ok ? 'dispatch_done' : 'dispatch_failed', {
-        mode, task: taskDir,
-        exit_code: exitCode, killed,
-        validation: validation.skipped ? 'skipped' : (validation.passed ? 'passed' : 'failed'),
-        validation_failures: validation.failures || [],
-        changed_files: validation.changedFiles || [],
-        finished_at: new Date().toISOString(),
-      }, workDir);
 
       const stdout = stdoutBuf.finalize();
       const stderr = stderrBuf.finalize();
@@ -676,6 +870,53 @@ async function dispatch(args) {
       if (stdout.trim()) output += stdout.trim();
       if (stderr.trim()) output += (output ? '\n\n--- stderr ---\n' : '') + stderr.trim();
       if (killed) output += `\n\n[PROCESS KILLED: exceeded ${timeout_minutes} minute timeout]`;
+
+      const status = classifyRunStatus(exitCode, killed, output);
+      const changedFiles = validation.changedFiles || diffInfo?.changedFiles || [];
+      const ok = status === 'done' && validation.passed && (!diffInfo || diffInfo.ok);
+      const finalStatus = ok
+        ? 'done'
+        : (!validation.passed ? 'validation_failed' : (diffInfo && !diffInfo.ok ? 'diff_failed' : status));
+      const report = {
+        worker_id: workerId,
+        status: finalStatus,
+        execution_mode: executionMode,
+        task: taskDir || null,
+        model,
+        model_source: modelFrom,
+        model_key: modelKey,
+        tools,
+        isolate_pi,
+        exit_code: exitCode,
+        killed,
+        validation: validation.skipped ? 'skipped' : (validation.passed ? 'passed' : 'failed'),
+        validation_failures: validation.failures || [],
+        changed_files: changedFiles,
+        shortstat: validation.shortstat || diffInfo?.shortstat || '',
+        prompt_file: promptPath,
+        log_file: logPath,
+        report_file: reportPath,
+        patch_file: executionMode === 'worktree' ? patchPath : null,
+        apply_command: executionMode === 'worktree' ? `git apply "${patchPath}"` : null,
+        worker_repo: executionMode === 'worktree' ? worker.repoDir : null,
+        diff: diffInfo,
+        finished_at: new Date().toISOString(),
+      };
+      writeJsonFile(reportPath, report);
+
+      await emitChannelEvent(channelName, ok ? 'dispatch_done' : 'dispatch_failed', {
+        mode, task: taskDir,
+        worker_id: workerId, execution_mode: executionMode,
+        status: report.status,
+        exit_code: exitCode, killed,
+        validation: report.validation,
+        validation_failures: validation.failures || [],
+        changed_files: changedFiles,
+        report_file: reportPath,
+        patch_file: report.patch_file,
+        apply_command: report.apply_command,
+        finished_at: report.finished_at,
+      }, workDir);
 
       let validationBlock = '';
       if (!validation.skipped) {
@@ -692,12 +933,17 @@ async function dispatch(args) {
         }
         validationBlock += '\n';
       }
+      let artifactBlock = `\n--- artifacts ---\nstatus: ${report.status}\nreport: ${reportPath}\n`;
+      if (executionMode === 'worktree') {
+        artifactBlock += `worker_repo: ${worker.repoDir}\npatch: ${patchPath}\napply: ${report.apply_command}\n`;
+        if (diffInfo && !diffInfo.ok) artifactBlock += `diff_error: ${diffInfo.error}\n`;
+      }
 
-      const isError = (exitCode !== 0 && !killed) || (!validation.skipped && !validation.passed);
+      const isError = !ok;
       resolve({
         content: [{
           type: 'text',
-          text: `${metaResponse}\nPi exited with code ${exitCode}.\n${validationBlock}\n--- output (head + tail) ---\n\n${output}`,
+          text: `${metaResponse}\nPi exited with code ${exitCode}.\n${artifactBlock}${validationBlock}\n--- output (head + tail) ---\n\n${output}`,
         }],
         isError,
       });
@@ -707,8 +953,24 @@ async function dispatch(args) {
       clearTimeout(timer);
       logStream.close();
       if (lockPath) releaseDispatchLock(lockPath);
+      writeJsonFile(reportPath, {
+        worker_id: workerId,
+        status: 'spawn_error',
+        execution_mode: executionMode,
+        task: taskDir || null,
+        error: err.message,
+        prompt_file: promptPath,
+        log_file: logPath,
+        report_file: reportPath,
+        patch_file: executionMode === 'worktree' ? patchPath : null,
+        worker_repo: executionMode === 'worktree' ? worker.repoDir : null,
+        finished_at: new Date().toISOString(),
+      });
       await emitChannelEvent(channelName, 'spawn_error', {
-        mode, task: taskDir, error: err.message, finished_at: new Date().toISOString(),
+        mode, task: taskDir,
+        worker_id: workerId, execution_mode: executionMode,
+        error: err.message, report_file: reportPath,
+        finished_at: new Date().toISOString(),
       }, workDir);
       resolve({
         content: [{ type: 'text', text: `${metaResponse}\nError spawning pi: ${err.message}` }],
@@ -777,20 +1039,22 @@ function previewPrompt(args) {
     mode = 'implement',
     task_dir: explicitTaskDir,
     working_directory: cwd,
+    execution_mode: executionModeInput,
     extra_instructions,
     scope,
     validation_commands = [],
   } = args;
   const workDir = cwd || process.cwd();
+  const executionMode = executionModeInput || defaultExecutionMode(mode);
   let taskDir = explicitTaskDir || resolveActiveTask(workDir);
   if (!taskDir && mode !== 'custom') return { content: [{ type: 'text', text: 'No active Trellis task found.' }], isError: true };
 
   let body;
   if (taskDir) {
     const context = assembleTrellisContext(workDir, taskDir, mode);
-    body = buildDispatchPrompt({ ...context, mode, extra_instructions, scope, validation_commands });
+    body = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands });
   } else {
-    body = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands);
+    body = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode);
   }
   return { content: [{ type: 'text', text: body }] };
 }
@@ -800,7 +1064,7 @@ function previewPrompt(args) {
 const TOOLS = [
   {
     name: 'dispatch',
-    description: 'Dispatch an implementation or check task to Pi. With an active Trellis task, reads implement.jsonl/check.jsonl + prd.md + design.md + implement.md to assemble Pi\'s prompt. When TRELLIS_CHANNEL (or channel param) is set, emits message events into the channel and skips the local dispatch lock. Optional post-validation params catch "exit 0 + no work" failures.',
+    description: 'Dispatch an implementation or check task to Pi. With an active Trellis task, reads implement.jsonl/check.jsonl + prd.md + design.md + implement.md to assemble Pi\'s prompt. Defaults to isolated worktree execution for implement/custom and read-only review for check. Emits Trellis channel events when TRELLIS_CHANNEL (or channel param) is set. Optional post-validation params catch "exit 0 + no work" failures.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -809,7 +1073,9 @@ const TOOLS = [
         working_directory: { type: 'string', description: 'Repo root. Defaults to cwd.' },
         model: { type: 'string', description: 'Logical name (implementer / reviewer / custom key from ~/.pi/config.toml [pi_adapter]) or fully qualified Pi route. Omit to use the default for the mode.' },
         thinking: { type: 'string', default: 'high' },
-        tools: { type: 'string', default: 'read,bash,edit,write,grep,find,ls' },
+        execution_mode: { type: 'string', enum: ['review', 'patch', 'worktree', 'direct'], description: 'review=read-only report, patch=final-answer diff, worktree=isolated git worktree + exported diff.patch, direct=legacy in-place execution. Defaults to worktree for implement/custom and review for check.' },
+        isolate_pi: { type: 'boolean', default: true, description: 'When true, disables Pi extensions/skills/context files/session persistence and uses a per-worker PI_CODING_AGENT_DIR.' },
+        tools: { type: 'string', description: 'Comma-separated Pi tools. Defaults by execution_mode: review=read,grep,find,ls; patch=read,bash,grep,find,ls; worktree/direct=read,bash,edit,write,grep,find,ls.' },
         timeout_minutes: { type: 'number', default: 60, description: 'Capped at 120.' },
         dry_run: { type: 'boolean', default: false, description: 'Build prompt without launching Pi.' },
         extra_instructions: { type: 'string' },
@@ -832,6 +1098,7 @@ const TOOLS = [
         mode: { type: 'string', enum: ['implement', 'check', 'custom'], default: 'implement' },
         task_dir: { type: 'string' },
         working_directory: { type: 'string' },
+        execution_mode: { type: 'string', enum: ['review', 'patch', 'worktree', 'direct'] },
         extra_instructions: { type: 'string' },
         scope: { type: 'string' },
         validation_commands: { type: 'array', items: { type: 'string' } },
