@@ -494,6 +494,17 @@ function runPostValidation(workDir, params) {
   let changedFiles = [];
   let shortstat = '';
   try {
+    // Intent-to-add makes newly created files appear in `git diff` without
+    // staging content in the repository. This keeps validation consistent
+    // between direct/patch/review modes and worktree diff export.
+    try {
+      execFileSync('git', ['add', '-N', '.'], {
+        cwd: workDir,
+        encoding: 'utf-8',
+        timeout: 10000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch {}
     const out = execSync('git diff --name-only HEAD', { cwd: workDir, encoding: 'utf-8', timeout: 10000 }).trim();
     changedFiles = out ? out.split('\n') : [];
     shortstat = execSync('git diff --shortstat HEAD', { cwd: workDir, encoding: 'utf-8', timeout: 10000 }).trim();
@@ -575,14 +586,13 @@ function makeWorkerId(mode, taskDir, scope, extraInstructions) {
 
 function seedPiAgentConfig(targetPiHome) {
   const srcDir = path.join(os.homedir(), '.pi', 'agent');
-  const dstDir = path.join(targetPiHome, 'agent');
   const required = ['models.json', 'settings.json'];
   let copied = 0;
   for (const f of required) {
     const src = path.join(srcDir, f);
     if (fs.existsSync(src)) {
-      fs.mkdirSync(dstDir, { recursive: true });
-      fs.copyFileSync(src, path.join(dstDir, f));
+      fs.mkdirSync(targetPiHome, { recursive: true });
+      fs.copyFileSync(src, path.join(targetPiHome, f));
       copied++;
     }
   }

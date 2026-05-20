@@ -1,6 +1,6 @@
 {
   "name": "@galaxy9day/pi-adapter",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Pi (GPT-5.5) executor adapter MCP for Trellis Phase 2.1 and standalone use. Acts as a Trellis channel adapter (parallel to claude.ts/codex.ts) when trellis channel is active; otherwise runs Pi as a subprocess with auto-validation.",
   "type": "module",
   "main": "index.js",
