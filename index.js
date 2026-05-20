@@ -42,7 +42,7 @@ import * as crypto from 'node:crypto';
 // ---- Constants ----
 
 const SERVER_NAME = 'pi-adapter';
-const SERVER_VERSION = '0.1.1';  // keep in sync with package.json
+const SERVER_VERSION = '0.1.4';  // keep in sync with package.json
 const TMP_RUNTIME_DIR = path.join(os.tmpdir(), SERVER_NAME);
 const CHANNEL_ENV_ALIASES = ['TRELLIS_CHANNEL', 'TRELLIS_CHANNEL_NAME'];
 const TRELLIS_BIN_ENV = 'TRELLIS_BINARY';
@@ -178,10 +178,10 @@ async function emitChannelEvent(channelName, eventName, payload, workDir) {
   try {
     const child = spawn(trellis, [
       'channel', 'send', channelName,
-      '--text', `${SERVER_NAME}: ${eventName}`,
-      '--tag', `pi:${eventName}`,
-      '--json', JSON.stringify(meta),
-    ], { cwd: workDir, stdio: 'ignore', detached: true });
+      '--as', SERVER_NAME,
+      '--stdin',
+    ], { cwd: workDir, stdio: ['pipe', 'ignore', 'ignore'], detached: true });
+    child.stdin.end(`${SERVER_NAME}: ${eventName}\n\n${JSON.stringify(meta, null, 2)}\n`);
     child.unref();
     return { ok: true, via: 'cli' };
   } catch (e) {
@@ -362,12 +362,15 @@ function readJsonlManifest(repoRoot, jsonlPath) {
   return result;
 }
 
-function resolveActiveTask(repoRoot) {
+function resolveActiveTask(repoRoot, trellisContextId) {
   if (!fs.existsSync(path.join(repoRoot, '.trellis'))) return null;
   try {
+    const env = trellisContextId
+      ? { ...process.env, TRELLIS_CONTEXT_ID: trellisContextId }
+      : process.env;
     const result = execSync(
       `python3 ./.trellis/scripts/task.py current --source`,
-      { encoding: 'utf-8', cwd: repoRoot, timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] },
+      { encoding: 'utf-8', cwd: repoRoot, timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], env },
     ).trim();
     const match = result.match(/^(\S+)/);
     return match ? match[1] : null;
@@ -695,6 +698,7 @@ async function dispatch(args) {
     dry_run = false,
     extra_instructions,
     scope,
+    trellis_context_id,
     validation_commands = [],
     min_files_changed,
     required_paths_modified,
@@ -732,7 +736,7 @@ async function dispatch(args) {
       };
     }
   } else {
-    taskDir = resolveActiveTask(workDir);
+    taskDir = resolveActiveTask(workDir, trellis_context_id);
   }
 
   let context = null;
@@ -746,7 +750,7 @@ async function dispatch(args) {
   } else {
     if (!extra_instructions) {
       return {
-        content: [{ type: 'text', text: 'No active Trellis task found. Either:\n1. Use a Trellis project with an active task\n2. Provide task_dir explicitly\n3. Use mode="custom" with extra_instructions\n4. Provide extra_instructions to describe the task.' }],
+        content: [{ type: 'text', text: 'No active Trellis task found. Either:\n1. Use a Trellis project with an active task and inherited TRELLIS_CONTEXT_ID\n2. Provide trellis_context_id explicitly\n3. Provide task_dir explicitly\n4. Use mode="custom" with extra_instructions\n5. Provide extra_instructions to describe the task.' }],
         isError: true,
       };
     }
@@ -1105,12 +1109,13 @@ function previewPrompt(args) {
     execution_mode: executionModeInput,
     extra_instructions,
     scope,
+    trellis_context_id,
     validation_commands = [],
   } = args;
   const workDir = cwd || process.cwd();
   const executionMode = executionModeInput || defaultExecutionMode(mode);
-  let taskDir = explicitTaskDir || resolveActiveTask(workDir);
-  if (!taskDir && mode !== 'custom') return { content: [{ type: 'text', text: 'No active Trellis task found.' }], isError: true };
+  let taskDir = explicitTaskDir || resolveActiveTask(workDir, trellis_context_id);
+  if (!taskDir && mode !== 'custom') return { content: [{ type: 'text', text: 'No active Trellis task found. Provide task_dir, trellis_context_id, or use custom mode with extra_instructions.' }], isError: true };
 
   let body;
   if (taskDir) {
@@ -1143,6 +1148,7 @@ const TOOLS = [
         dry_run: { type: 'boolean', default: false, description: 'Build prompt without launching Pi.' },
         extra_instructions: { type: 'string' },
         scope: { type: 'string', description: 'File/path constraints stated to Pi.' },
+        trellis_context_id: { type: 'string', description: 'Optional Trellis session/context id. Passed as TRELLIS_CONTEXT_ID when auto-resolving the active task via task.py current.' },
         validation_commands: { type: 'array', items: { type: 'string' }, description: 'Commands Pi runs before reporting done.' },
         channel: { type: 'string', description: 'Trellis channel name. Overrides TRELLIS_CHANNEL / TRELLIS_CHANNEL_NAME env. When set, message events are emitted into the channel for audit.' },
         min_files_changed: { type: 'number', description: 'Fail if fewer files are modified after Pi exits.' },
@@ -1164,6 +1170,7 @@ const TOOLS = [
         execution_mode: { type: 'string', enum: ['review', 'patch', 'worktree', 'direct'] },
         extra_instructions: { type: 'string' },
         scope: { type: 'string' },
+        trellis_context_id: { type: 'string' },
         validation_commands: { type: 'array', items: { type: 'string' } },
       },
     },

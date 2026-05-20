@@ -5,7 +5,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that lets Claude Code / Codex / any MCP-aware orchestrator dispatch coding tasks to the **Pi coding agent** (`pi` CLI).
 
-Acts as a **Trellis channel adapter** (parallel to the built-in `claude.ts` and `codex.ts` adapters) when [`trellis channel`](https://docs.trytrellis.app/) is active. Falls back to a standalone subprocess path with its own lock + auto-validation when invoked outside Trellis.
+When Trellis is present, this MCP reads Trellis task artifacts and can optionally emit **non-invasive Trellis channel audit messages**. It does **not** register as a native Trellis channel provider/worker. Outside Trellis, it falls back to a standalone subprocess path with its own lock + auto-validation.
 
 ---
 
@@ -15,7 +15,7 @@ Acts as a **Trellis channel adapter** (parallel to the built-in `claude.ts` and 
 - Spawns Pi with sanitised environment (credential-shaped vars are stripped before inheritance).
 - Defaults implementation/custom dispatches to an isolated git worktree under `.trellis/.runtime/pi-workers/<worker-id>/`, then exports `diff.patch` and `report.json` for the orchestrator to review/apply.
 - Defaults check dispatches to read-only review mode (`read,grep,find,ls`) so Pi can supplement quality review without mutating the repo.
-- In channel mode: emits bookend events into the Trellis channel via `@mindfoldhq/trellis-core`'s `sendMessage`, so the audit trail belongs to Trellis core.
+- In channel mode: emits best-effort bookend audit messages into the Trellis channel via `@mindfoldhq/trellis-core`'s `sendMessage`.
 - Runs post-execution validation against `git diff` (`min_files_changed`, `required_paths_modified`, `forbidden_paths`, `min_diff_lines`) — catches "exit 0 + no useful work" failures before the orchestrator sees them.
 - Resolves Pi model names from `~/.pi/config.toml` so you never hard-code a model into your scripts.
 
@@ -88,6 +88,7 @@ Assemble context, run Pi, optionally emit channel events, run post-validation, r
 | `dry_run` | boolean | Build prompt without launching Pi. |
 | `extra_instructions` | string | Additional prompt text appended after assembled context. |
 | `scope` | string | File/path constraints communicated to Pi. |
+| `trellis_context_id` | string | Optional Trellis session/context id. Passed as `TRELLIS_CONTEXT_ID` when auto-resolving the active task. |
 | `validation_commands` | string[] | Commands Pi runs before reporting done. |
 | `channel` | string | Trellis channel name. Overrides `TRELLIS_CHANNEL` / `TRELLIS_CHANNEL_NAME` env. |
 | `min_files_changed` | number | Post-validation: fail if fewer files modified. |
@@ -120,14 +121,15 @@ Reads the tail of a Pi output log (produced by `dispatch`).
 
 When `dispatch` detects `TRELLIS_CHANNEL` / `TRELLIS_CHANNEL_NAME` env var (or an explicit `channel` arg), the adapter:
 
-1. **Skips its own dispatch lock.** The channel's `worker_guard` owns liveness, idle reclaim, and the live-worker cap.
-2. **Emits bookend events** via `@mindfoldhq/trellis-core/channel`'s `sendMessage`:
-   - `pi:dispatch_start` when Pi spawns (tagged, with structured `meta`)
-   - `pi:dispatch_done` / `pi:dispatch_failed` / `pi:spawn_error` on exit (with exit code, validation status, changed files)
-3. **Three-tier fallback**: if `@mindfoldhq/trellis-core` is unavailable, falls back to `trellis channel send` CLI (async); if that's also missing, drops the event with a stderr note. Dispatch never blocks on channel emission.
-4. **Local log still written** at `.trellis/.runtime/pi-<ts>-output.log` (or `/tmp/pi-adapter/...`) for debugging.
+1. **Keeps its own local dispatch lock.** A channel message does not make Pi a native Trellis worker; Trellis `worker_guard` does not own this subprocess lifecycle.
+2. **Emits bookend audit messages** via `@mindfoldhq/trellis-core/channel`'s `sendMessage`:
+   - text `pi-adapter: dispatch_start` when Pi spawns
+   - text `pi-adapter: dispatch_done` / `dispatch_failed` / `spawn_error` on exit
+   - structured `meta` includes `schema: "pi-adapter.dispatch.v1"`, exit code, validation status, changed files, report/log/patch paths
+3. **Three-tier fallback**: if `@mindfoldhq/trellis-core` is unavailable, falls back to official `trellis channel send --as pi-adapter --stdin` CLI shape (async); if that's also missing, drops the event with a stderr note. Dispatch never blocks on channel emission.
+4. **Local log still written** at `.trellis/.runtime/pi-workers/<worker-id>/output.log` (or `/tmp/pi-adapter/...`) for debugging.
 
-Per-message streaming of Pi output is **not** parsed into events — Pi's stdout isn't `stream-json`. The bookend events plus the local log are the audit trail.
+Per-message streaming of Pi output is **not** parsed into events — Pi's stdout isn't `stream-json`. These audit messages are normal Trellis `message` events, not native `spawned` / `done` / `killed` worker lifecycle events. Read the MCP result, `report.json`, `output.log`, or use `read_report` for the authoritative result.
 
 ## Standalone (no Trellis) mode
 
