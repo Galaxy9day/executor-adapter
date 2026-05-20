@@ -151,6 +151,8 @@ function detectChannel(args, env) {
 async function emitChannelEvent(channelName, eventName, payload, workDir) {
   if (!channelName) return { ok: true, reason: 'no-channel' };
 
+  const meta = { schema: 'pi-adapter.dispatch.v1', ...payload };
+
   const sendMessage = await getTrellisCoreSendMessage();
   if (sendMessage) {
     try {
@@ -160,7 +162,7 @@ async function emitChannelEvent(channelName, eventName, payload, workDir) {
         by: SERVER_NAME,
         text: `${SERVER_NAME}: ${eventName}`,
         tag: `pi:${eventName}`,
-        meta: payload,
+        meta,
       });
       return { ok: true, via: 'trellis-core' };
     } catch (e) {
@@ -178,7 +180,7 @@ async function emitChannelEvent(channelName, eventName, payload, workDir) {
       'channel', 'send', channelName,
       '--text', `${SERVER_NAME}: ${eventName}`,
       '--tag', `pi:${eventName}`,
-      '--json', JSON.stringify(payload),
+      '--json', JSON.stringify(meta),
     ], { cwd: workDir, stdio: 'ignore', detached: true });
     child.unref();
     return { ok: true, via: 'cli' };
@@ -203,7 +205,7 @@ function buildPiEnv(parentEnv) {
   return { env: out, stripped };
 }
 
-// ---- Dispatch lock (only used when no channel is active) ----
+// ---- Dispatch lock (always acquired; Trellis channel does not own Pi worker lifecycle) ----
 
 const _activeLocks = new Set();
 
@@ -217,20 +219,35 @@ function dispatchLockPath(runtimeDir, taskDir, scope, extraInstructions) {
 }
 
 function acquireDispatchLock(lockPath) {
+  // Stale-lock detection: if a lock file exists, check if the holder is alive.
   if (fs.existsSync(lockPath)) {
     try {
       const content = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
       const pid = content.pid;
       if (pid) {
         try { process.kill(pid, 0); return { acquired: false, holder: content }; }
-        catch { /* stale, fall through */ }
+        catch { /* stale — holder dead, fall through to overwrite */ }
       }
-    } catch { /* malformed, fall through */ }
+    } catch { /* malformed lock file, fall through */ }
   }
-  fs.writeFileSync(lockPath, JSON.stringify({
-    pid: process.pid,
-    startedAt: new Date().toISOString(),
-  }));
+  // Atomic exclusive create to prevent TOCTOU races between the check above
+  // and the write. O_CREAT|O_EXCL (flag 'wx') fails if another process
+  // created the file in the window.
+  try {
+    const fd = fs.openSync(lockPath, 'wx');
+    fs.writeSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    fs.closeSync(fd);
+  } catch (e) {
+    if (e.code === 'EEXIST') {
+      // Race lost — re-read to report who holds it
+      try {
+        const content = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
+        return { acquired: false, holder: content };
+      } catch { /* give up, report generic */ }
+      return { acquired: false, holder: { pid: null, startedAt: null } };
+    }
+    throw e;
+  }
   _activeLocks.add(lockPath);
   return { acquired: true };
 }
@@ -556,6 +573,22 @@ function makeWorkerId(mode, taskDir, scope, extraInstructions) {
   return `pi-${mode}-${ts}-${fp}`;
 }
 
+function seedPiAgentConfig(targetPiHome) {
+  const srcDir = path.join(os.homedir(), '.pi', 'agent');
+  const dstDir = path.join(targetPiHome, 'agent');
+  const required = ['models.json', 'settings.json'];
+  let copied = 0;
+  for (const f of required) {
+    const src = path.join(srcDir, f);
+    if (fs.existsSync(src)) {
+      fs.mkdirSync(dstDir, { recursive: true });
+      fs.copyFileSync(src, path.join(dstDir, f));
+      copied++;
+    }
+  }
+  return copied;
+}
+
 function createWorkerRuntime(runtimeDir, workerId) {
   const workerDir = path.join(runtimeDir, 'pi-workers', workerId);
   const repoDir = path.join(workerDir, 'repo');
@@ -563,7 +596,11 @@ function createWorkerRuntime(runtimeDir, workerId) {
   const sessionDir = path.join(workerDir, 'sessions');
   fs.mkdirSync(piHome, { recursive: true });
   fs.mkdirSync(sessionDir, { recursive: true });
-  return { workerId, workerDir, repoDir, piHome, sessionDir };
+  const configFiles = seedPiAgentConfig(piHome);
+  if (configFiles === 0) {
+    console.error(`[${SERVER_NAME}] WARNING: no Pi agent config files found in ~/.pi/agent/; Pi subprocess may fail with "Model not found"`);
+  }
+  return { workerId, workerDir, repoDir, piHome, sessionDir, configFiles };
 }
 
 function createWorktree(sourceDir, repoDir) {
@@ -738,6 +775,7 @@ async function dispatch(args) {
   metaResponse += `Tools: ${tools}\n`;
   metaResponse += `Timeout: ${timeout_minutes} min\n`;
   metaResponse += `Channel: ${channelName || '(none, local mode)'}\n`;
+  metaResponse += `Pi config: seeded ${worker.configFiles || 0} agent file(s) into isolated piHome\n`;
 
   const { env: piEnv, stripped: strippedEnv } = buildPiEnv(process.env);
   if (strippedEnv.length > 0) {
@@ -757,18 +795,16 @@ async function dispatch(args) {
   if (!piBin) return { content: [{ type: 'text', text: `Error: pi binary not found in PATH (or ${PI_BIN_ENV} env).\n\n${metaResponse}` }], isError: true };
 
   let lockPath = null;
-  if (!channelName) {
-    lockPath = dispatchLockPath(runtimeDir, taskDir, scope, extra_instructions);
-    const lr = acquireDispatchLock(lockPath);
-    if (!lr.acquired) {
-      return {
-        content: [{
-          type: 'text',
-          text: `Error: another dispatch with identical (task, scope, extra_instructions) is already running.\n  Holder PID: ${lr.holder?.pid}\n  Started:    ${lr.holder?.startedAt}\n  Lock file:  ${lockPath}\n\nIf the holder is actually dead, remove the lock file manually.\n\n${metaResponse}`,
-        }],
-        isError: true,
-      };
-    }
+  lockPath = dispatchLockPath(runtimeDir, taskDir, scope, extra_instructions);
+  const lr = acquireDispatchLock(lockPath);
+  if (!lr.acquired) {
+    return {
+      content: [{
+        type: 'text',
+        text: `Error: another dispatch with identical (task, scope, extra_instructions) is already running.\n  Holder PID: ${lr.holder?.pid}\n  Started:    ${lr.holder?.startedAt}\n  Lock file:  ${lockPath}\n\nIf the holder is actually dead, remove the lock file manually.\n\n${metaResponse}`,
+      }],
+      isError: true,
+    };
   }
 
   let piWorkDir = workDir;
@@ -991,12 +1027,28 @@ function smoke(args) {
   const piBin = findPiBinary();
   if (!piBin) return { content: [{ type: 'text', text: 'Error: pi binary not found in PATH.' }], isError: true };
 
+  // Use the same env scrub + isolation as dispatch so smoke catches config issues.
+  const { env: piEnv } = buildPiEnv(process.env);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-smoke-'));
+  const isolatedHome = path.join(tmpDir, 'pi-home');
+  fs.mkdirSync(isolatedHome, { recursive: true });
+  const configFiles = seedPiAgentConfig(isolatedHome);
+
   return new Promise((resolve) => {
     const proc = spawn(piBin, [
       '--model', model,
       '--tools', 'read',
       '-p', 'Respond with exactly the string: PI READY. No other words.',
-    ], { cwd: working_directory || process.cwd(), env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'] });
+    ], {
+      cwd: working_directory || process.cwd(),
+      env: {
+        ...piEnv,
+        PI_CODING_AGENT_DIR: isolatedHome,
+        PI_OFFLINE: '1',
+        PI_SKIP_VERSION_CHECK: '1',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
 
     let stdout = '';
     let stderr = '';
@@ -1005,17 +1057,18 @@ function smoke(args) {
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
     proc.on('close', (code) => {
       clearTimeout(timer);
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
       const ready = stdout.includes('PI READY');
+      let text = `Pi smoke: ${ready ? 'PASSED' : 'FAILED'} | model=${model} (${modelFrom}${modelKey ? `:${modelKey}` : ''}) | exit=${code} | config_seeded=${configFiles}`;
+      text += `\nOutput: ${(stdout || stderr).trim().slice(0, 500)}`;
       resolve({
-        content: [{
-          type: 'text',
-          text: `Pi smoke: ${ready ? 'PASSED' : 'FAILED'} | model=${model} (${modelFrom}${modelKey ? `:${modelKey}` : ''}) | exit=${code}\nOutput: ${(stdout || stderr).trim().slice(0, 500)}`,
-        }],
+        content: [{ type: 'text', text }],
         isError: !ready,
       });
     });
     proc.on('error', (err) => {
       clearTimeout(timer);
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
       resolve({ content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true });
     });
   });
@@ -1081,7 +1134,7 @@ const TOOLS = [
         extra_instructions: { type: 'string' },
         scope: { type: 'string', description: 'File/path constraints stated to Pi.' },
         validation_commands: { type: 'array', items: { type: 'string' }, description: 'Commands Pi runs before reporting done.' },
-        channel: { type: 'string', description: 'Trellis channel name. Overrides TRELLIS_CHANNEL / TRELLIS_CHANNEL_NAME env. When set, lock is skipped and message events are emitted.' },
+        channel: { type: 'string', description: 'Trellis channel name. Overrides TRELLIS_CHANNEL / TRELLIS_CHANNEL_NAME env. When set, message events are emitted into the channel for audit.' },
         min_files_changed: { type: 'number', description: 'Fail if fewer files are modified after Pi exits.' },
         required_paths_modified: { type: 'array', items: { type: 'string' }, description: 'Fail if any path NOT in the diff.' },
         forbidden_paths: { type: 'array', items: { type: 'string' }, description: 'Fail if any path IS in the diff. Trailing / matches directory prefix.' },
