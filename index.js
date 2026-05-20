@@ -42,7 +42,7 @@ import * as crypto from 'node:crypto';
 // ---- Constants ----
 
 const SERVER_NAME = 'pi-adapter';
-const SERVER_VERSION = '0.1.5';  // keep in sync with package.json
+const SERVER_VERSION = '0.1.6';  // keep in sync with package.json
 const TMP_RUNTIME_DIR = path.join(os.tmpdir(), SERVER_NAME);
 const CHANNEL_ENV_ALIASES = ['TRELLIS_CHANNEL', 'TRELLIS_CHANNEL_NAME'];
 const TRELLIS_BIN_ENV = 'TRELLIS_BINARY';
@@ -67,6 +67,16 @@ function resolvePath(p, cwd) {
 
 function logErr(msg) {
   process.stderr.write(`[${SERVER_NAME}] ${msg}\n`);
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label || 'operation'} timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 function resolveRuntimeDir(workDir) {
@@ -156,14 +166,14 @@ async function emitChannelEvent(channelName, eventName, payload, workDir) {
   const sendMessage = await getTrellisCoreSendMessage();
   if (sendMessage) {
     try {
-      await sendMessage({
+      await withTimeout(sendMessage({
         channel: channelName,
         cwd: workDir,
         by: SERVER_NAME,
         text: `${SERVER_NAME}: ${eventName}`,
         tag: `pi:${eventName}`,
         meta,
-      });
+      }), 2000, 'trellis-core sendMessage');
       return { ok: true, via: 'trellis-core' };
     } catch (e) {
       logErr(`trellis-core sendMessage failed (${e.message}) — falling back to CLI`);
@@ -181,7 +191,13 @@ async function emitChannelEvent(channelName, eventName, payload, workDir) {
       '--as', SERVER_NAME,
       '--stdin',
     ], { cwd: workDir, stdio: ['pipe', 'ignore', 'ignore'], detached: true });
-    child.stdin.end(`${SERVER_NAME}: ${eventName}\n\n${JSON.stringify(meta, null, 2)}\n`);
+    child.on('error', (e) => logErr(`trellis CLI fallback spawn failed: ${e.message}`));
+    child.stdin.on('error', (e) => logErr(`trellis CLI fallback stdin failed: ${e.message}`));
+    try {
+      child.stdin.end(`${SERVER_NAME}: ${eventName}\n\n${JSON.stringify(meta, null, 2)}\n`);
+    } catch (e) {
+      logErr(`trellis CLI fallback stdin write failed: ${e.message}`);
+    }
     child.unref();
     return { ok: true, via: 'cli' };
   } catch (e) {
@@ -208,6 +224,7 @@ function buildPiEnv(parentEnv) {
 // ---- Dispatch lock (always acquired; Trellis channel does not own Pi worker lifecycle) ----
 
 const _activeLocks = new Set();
+const _activeChildren = new Set();
 
 function dispatchLockPath(runtimeDir, taskDir, scope, extraInstructions) {
   const fp = crypto
@@ -264,9 +281,34 @@ function cleanupAllLocks() {
   _activeLocks.clear();
 }
 
+function trackChild(proc) {
+  _activeChildren.add(proc);
+  const done = () => _activeChildren.delete(proc);
+  proc.once('close', done);
+  proc.once('error', done);
+  return proc;
+}
+
+function shutdownWithChildren(exitCode) {
+  for (const child of _activeChildren) {
+    try { child.kill('SIGTERM'); } catch {}
+  }
+  if (_activeChildren.size === 0) {
+    cleanupAllLocks();
+    process.exit(exitCode);
+  }
+  setTimeout(() => {
+    for (const child of _activeChildren) {
+      try { child.kill('SIGKILL'); } catch {}
+    }
+    cleanupAllLocks();
+    process.exit(exitCode);
+  }, 5000);
+}
+
 process.on('exit', cleanupAllLocks);
-process.on('SIGINT',  () => { cleanupAllLocks(); process.exit(130); });
-process.on('SIGTERM', () => { cleanupAllLocks(); process.exit(143); });
+process.on('SIGINT',  () => shutdownWithChildren(130));
+process.on('SIGTERM', () => shutdownWithChildren(143));
 
 // ---- Model resolution (TOML, no hard-codes) ----
 
@@ -873,7 +915,7 @@ async function dispatch(args) {
     const stdoutBuf = makeHeadTailBuffer();
     const stderrBuf = makeHeadTailBuffer(2 * 1024, 8 * 1024);
 
-    const proc = spawn(piBin, piArgs, {
+    const proc = trackChild(spawn(piBin, piArgs, {
       cwd: piWorkDir,
       env: {
         ...piEnv,
@@ -884,7 +926,7 @@ async function dispatch(args) {
       },
       // Pi's -p mode blocks on stdin EOF if stdin is a live pipe.
       stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    }));
 
     proc.stdout.on('data', (d) => stdoutBuf.push(d.toString()));
     proc.stderr.on('data', (d) => stderrBuf.push(d.toString()));
@@ -893,18 +935,30 @@ async function dispatch(args) {
     proc.stdout.pipe(logStream);
     proc.stderr.pipe(logStream);
 
+    let killTimer = null;
+    let settled = false;
+    let spawnErrored = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      if (lockPath) releaseDispatchLock(lockPath);
+      resolve(result);
+    };
+
     const timer = setTimeout(() => {
       killed = true;
       proc.kill('SIGTERM');
-      setTimeout(() => proc.kill('SIGKILL'), 5000);
+      killTimer = setTimeout(() => proc.kill('SIGKILL'), 5000);
     }, timeout);
 
-    proc.on('close', async (code) => {
-      clearTimeout(timer);
+    proc.on('close', async (code, signal) => {
+      if (spawnErrored || settled) return;
       logStream.close();
-      if (lockPath) releaseDispatchLock(lockPath);
 
-      const exitCode = code || 0;
+      const exitCode = code;
+      const signaled = Boolean(signal);
       let diffInfo = null;
       if (executionMode === 'worktree') {
         diffInfo = prepareWorkerDiff(worker.repoDir, patchPath);
@@ -920,8 +974,9 @@ async function dispatch(args) {
       if (stdout.trim()) output += stdout.trim();
       if (stderr.trim()) output += (output ? '\n\n--- stderr ---\n' : '') + stderr.trim();
       if (killed) output += `\n\n[PROCESS KILLED: exceeded ${timeout_minutes} minute timeout]`;
+      if (signaled && !killed) output += `\n\n[PROCESS EXITED BY SIGNAL: ${signal}]`;
 
-      const status = classifyRunStatus(exitCode, killed, output);
+      const status = signaled ? 'killed' : classifyRunStatus(exitCode, killed, output);
       const changedFiles = validation.changedFiles || diffInfo?.changedFiles || [];
       const ok = status === 'done' && validation.passed && (!diffInfo || diffInfo.ok);
       const finalStatus = ok
@@ -938,7 +993,8 @@ async function dispatch(args) {
         tools,
         isolate_pi,
         exit_code: exitCode,
-        killed,
+        signal: signal || null,
+        killed: killed || signaled,
         validation: validation.skipped ? 'skipped' : (validation.passed ? 'passed' : 'failed'),
         validation_failures: validation.failures || [],
         changed_files: changedFiles,
@@ -958,7 +1014,7 @@ async function dispatch(args) {
         mode, task: taskDir,
         worker_id: workerId, execution_mode: executionMode,
         status: report.status,
-        exit_code: exitCode, killed,
+        exit_code: exitCode, signal: signal || null, killed: killed || signaled,
         validation: report.validation,
         validation_failures: validation.failures || [],
         changed_files: changedFiles,
@@ -990,19 +1046,19 @@ async function dispatch(args) {
       }
 
       const isError = !ok;
-      resolve({
+      finish({
         content: [{
           type: 'text',
-          text: `${metaResponse}\nPi exited with code ${exitCode}.\n${artifactBlock}${validationBlock}\n--- output (head + tail) ---\n\n${output}`,
+          text: `${metaResponse}\nPi exited with code ${exitCode}${signal ? ` (signal ${signal})` : ''}.\n${artifactBlock}${validationBlock}\n--- output (head + tail) ---\n\n${output}`,
         }],
         isError,
       });
     });
 
     proc.on('error', async (err) => {
-      clearTimeout(timer);
+      if (settled) return;
+      spawnErrored = true;
       logStream.close();
-      if (lockPath) releaseDispatchLock(lockPath);
       writeJsonFile(reportPath, {
         worker_id: workerId,
         status: 'spawn_error',
@@ -1022,7 +1078,7 @@ async function dispatch(args) {
         error: err.message, report_file: reportPath,
         finished_at: new Date().toISOString(),
       }, workDir);
-      resolve({
+      finish({
         content: [{ type: 'text', text: `${metaResponse}\nError spawning pi: ${err.message}` }],
         isError: true,
       });
@@ -1049,7 +1105,7 @@ function smoke(args) {
   const configFiles = seedPiAgentConfig(isolatedHome);
 
   return new Promise((resolve) => {
-    const proc = spawn(piBin, [
+    const proc = trackChild(spawn(piBin, [
       '--model', model,
       '--tools', 'read',
       '-p', 'Respond with exactly the string: PI READY. No other words.',
@@ -1063,28 +1119,39 @@ function smoke(args) {
       },
       // Pi's -p mode blocks on stdin EOF if stdin is a live pipe.
       stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    }));
 
     let stdout = '';
     let stderr = '';
-    const timer = setTimeout(() => proc.kill('SIGTERM'), 60000);
+    let killed = false;
+    let settled = false;
+    let killTimer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      killed = true;
+      proc.kill('SIGTERM');
+      killTimer = setTimeout(() => proc.kill('SIGKILL'), 5000);
+    }, 60000);
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
-    proc.on('close', (code) => {
-      clearTimeout(timer);
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    proc.on('close', (code, signal) => {
       const ready = stdout.includes('PI READY');
-      let text = `Pi smoke: ${ready ? 'PASSED' : 'FAILED'} | model=${model} (${modelFrom}${modelKey ? `:${modelKey}` : ''}) | exit=${code} | config_seeded=${configFiles}`;
+      let text = `Pi smoke: ${ready ? 'PASSED' : 'FAILED'} | model=${model} (${modelFrom}${modelKey ? `:${modelKey}` : ''}) | exit=${code} | signal=${signal || 'none'} | killed=${killed} | config_seeded=${configFiles}`;
       text += `\nOutput: ${(stdout || stderr).trim().slice(0, 500)}`;
-      resolve({
+      finish({
         content: [{ type: 'text', text }],
         isError: !ready,
       });
     });
     proc.on('error', (err) => {
-      clearTimeout(timer);
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-      resolve({ content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true });
+      finish({ content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true });
     });
   });
 }
@@ -1095,8 +1162,11 @@ function readReport(args) {
   const resolved = resolvePath(log_file, working_directory);
   if (!fs.existsSync(resolved)) return { content: [{ type: 'text', text: `Log not found: ${resolved}` }], isError: true };
   try {
-    const content = execSync(`tail -${lines} "${resolved}"`, { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
-    return { content: [{ type: 'text', text: `--- ${resolved} (last ${lines} lines) ---\n\n${content}` }] };
+    const n = Number.isFinite(Number(lines)) ? Math.max(1, Math.min(10000, Math.floor(Number(lines)))) : 200;
+    const raw = fs.readFileSync(resolved, 'utf-8');
+    const parts = raw.split('\n');
+    const content = parts.slice(Math.max(0, parts.length - n - 1)).join('\n');
+    return { content: [{ type: 'text', text: `--- ${resolved} (last ${n} lines) ---\n\n${content}` }] };
   } catch (e) {
     return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true };
   }
