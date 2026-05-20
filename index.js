@@ -42,7 +42,7 @@ import * as crypto from 'node:crypto';
 // ---- Constants ----
 
 const SERVER_NAME = 'pi-adapter';
-const SERVER_VERSION = '0.1.4';  // keep in sync with package.json
+const SERVER_VERSION = '0.1.5';  // keep in sync with package.json
 const TMP_RUNTIME_DIR = path.join(os.tmpdir(), SERVER_NAME);
 const CHANNEL_ENV_ALIASES = ['TRELLIS_CHANNEL', 'TRELLIS_CHANNEL_NAME'];
 const TRELLIS_BIN_ENV = 'TRELLIS_BINARY';
@@ -1061,7 +1061,8 @@ function smoke(args) {
         PI_OFFLINE: '1',
         PI_SKIP_VERSION_CHECK: '1',
       },
-      stdio: ['pipe', 'pipe', 'pipe'],
+      // Pi's -p mode blocks on stdin EOF if stdin is a live pipe.
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     let stdout = '';
