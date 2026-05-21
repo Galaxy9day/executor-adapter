@@ -32,6 +32,15 @@ function makeRepo({ trellis = false } = {}) {
   return repo;
 }
 
+function makePiHome() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-adapter-home-'));
+  const agent = path.join(home, '.pi', 'agent');
+  fs.mkdirSync(agent, { recursive: true });
+  fs.writeFileSync(path.join(agent, 'models.json'), '{"models":[]}\n', 'utf-8');
+  fs.writeFileSync(path.join(agent, 'settings.json'), '{"settings":{}}\n', 'utf-8');
+  return home;
+}
+
 function startMcp(extraEnv = {}) {
   const child = spawn(process.execPath, [SERVER], {
     cwd: ROOT,
@@ -201,6 +210,34 @@ test('preview_prompt supports standalone implement mode with explicit instructio
   }
 });
 
+test('smoke failure includes stdout, stderr, safe env, and seeded config paths', async () => {
+  const repo = makeRepo();
+  const home = makePiHome();
+  const mcp = startMcp({ FAKE_PI_SCENARIO: 'smoke-fail', HOME: home });
+  try {
+    await mcp.init();
+    const result = await mcp.callTool('smoke', {
+      model: 'fake/model',
+      working_directory: repo,
+    });
+    assert.equal(result.isError, true);
+    const text = result.content[0].text;
+    assert.match(text, /Pi smoke: FAILED/);
+    assert.match(text, /model=fake\/model/);
+    assert.match(text, /config_seeded:/);
+    assert.match(text, /models\.json/);
+    assert.match(text, /settings\.json/);
+    assert.match(text, /env_passed:/);
+    assert.match(text, /PI_CODING_AGENT_DIR=/);
+    assert.match(text, /PI_CODING_AGENT_SESSION_DIR=/);
+    assert.match(text, /pi stdout:\nfake pi starting/);
+    assert.match(text, /pi stderr:\nError: Model "fake\/model" not found/);
+    assert.match(text, /diagnostic:/);
+  } finally {
+    mcp.close();
+  }
+});
+
 test('patch-ready limited validation is not reported as blocked', async () => {
   const repo = makeRepo({ trellis: true });
   const mcp = startMcp({ FAKE_PI_SCENARIO: 'limited' });
@@ -285,6 +322,48 @@ test('required path missing fails validation', async () => {
     const report = readReport(result);
     assert.equal(report.result_class, 'validation_failed');
     assert.equal(report.validation_failures[0].rule, 'required_paths_modified');
+  } finally {
+    mcp.close();
+  }
+});
+
+test('cleanup_runtime dry-runs and removes old worker directories', async () => {
+  const repo = makeRepo({ trellis: true });
+  const workers = path.join(repo, '.trellis', '.runtime', 'pi-workers');
+  const oldWorker = path.join(workers, 'pi-old-worker');
+  const newWorker = path.join(workers, 'pi-new-worker');
+  fs.mkdirSync(oldWorker, { recursive: true });
+  fs.mkdirSync(newWorker, { recursive: true });
+  fs.writeFileSync(path.join(oldWorker, 'output.log'), 'old worker\n', 'utf-8');
+  fs.writeFileSync(path.join(newWorker, 'output.log'), 'new worker\n', 'utf-8');
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  fs.utimesSync(oldWorker, oldDate, oldDate);
+
+  const mcp = startMcp();
+  try {
+    await mcp.init();
+    const dryRun = await mcp.callTool('cleanup_runtime', {
+      working_directory: repo,
+      retain_days: 7,
+      dry_run: true,
+    });
+    const dryRunReport = JSON.parse(dryRun.content[0].text);
+    assert.equal(dryRunReport.removed.length, 1);
+    assert.equal(dryRunReport.removed[0].worker_id, 'pi-old-worker');
+    assert.ok(dryRunReport.bytes_would_free > 0);
+    assert.ok(fs.existsSync(oldWorker));
+
+    const result = await mcp.callTool('cleanup_runtime', {
+      working_directory: repo,
+      retain_days: 7,
+      dry_run: false,
+    });
+    const report = JSON.parse(result.content[0].text);
+    assert.equal(report.removed.length, 1);
+    assert.equal(report.retained.length, 1);
+    assert.ok(report.bytes_freed > 0);
+    assert.equal(fs.existsSync(oldWorker), false);
+    assert.equal(fs.existsSync(newWorker), true);
   } finally {
     mcp.close();
   }

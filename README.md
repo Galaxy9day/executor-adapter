@@ -69,7 +69,7 @@ dispatch(model="anthropic/claude-opus-4-7", ...)
 
 ## Tools
 
-This server exposes 4 MCP tools (namespace `pi-adapter`):
+This server exposes 5 MCP tools (namespace `pi-adapter`):
 
 ### `dispatch(...)`
 
@@ -151,11 +151,15 @@ Same args as `dispatch` (subset). Renders the prompt without launching Pi.
 
 ### `smoke({ model? })`
 
-One-shot connectivity test. Verifies Pi binary is on PATH and the resolved model answers a trivial round-trip.
+One-shot connectivity test. Verifies Pi binary is on PATH and the resolved model answers a trivial round-trip. On failure it prints separate `pi stdout` and `pi stderr` blocks, the resolved model route, safe Pi env values, and the config files copied into the isolated Pi home.
 
 ### `read_report({ log_file?, report_file?, runtime_dir?, worker_id?, lines? })`
 
 Reads `report.json` when available and prints a short summary first: `result_class`, `project_mode`, `changed_files`, `apply_command`, next steps, and recommended commands. It can resolve both Trellis runtime directories (`.trellis/.runtime/pi-workers/<worker-id>/`) and standalone runtime directories (`/tmp/pi-adapter/pi-workers/<worker-id>/`). Log tail output remains available via `lines`.
+
+### `cleanup_runtime({ working_directory?, retain_days?, dry_run? })`
+
+Prunes old `pi-*` worker directories from the adapter runtime (`.trellis/.runtime/pi-workers/` in Trellis repos, `/tmp/pi-adapter/pi-workers/` otherwise). It reports removed/retained worker dirs and freed bytes. Use `dry_run=true` before deleting.
 
 ## Channel mode
 
@@ -219,6 +223,8 @@ Auto-validation catches obvious failures. The orchestrator should still:
 9. Commit only from the orchestrator after validation passes.
 
 Do not start expensive full validation before independent check work that may modify code; a check fix invalidates the full run.
+
+For data-dependent worktree dispatches, pass stable schema or small sample artifacts through `context_files` when Pi needs facts that are not committed. Isolated worktrees do not include gitignored, generated, or uncommitted derived data.
 
 See [the body of the SKILL.md](./SKILL.md) (when used with the matching [coworkers](https://github.com/Galaxy9day/coworkers) skill) for the full protocol.
 

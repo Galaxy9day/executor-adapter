@@ -42,7 +42,7 @@ import * as crypto from 'node:crypto';
 // ---- Constants ----
 
 const SERVER_NAME = 'pi-adapter';
-const SERVER_VERSION = '0.1.8';  // keep in sync with package.json
+const SERVER_VERSION = '0.8.1';  // keep in sync with package.json
 const TMP_RUNTIME_DIR = path.join(os.tmpdir(), SERVER_NAME);
 const CHANNEL_ENV_ALIASES = ['TRELLIS_CHANNEL', 'TRELLIS_CHANNEL_NAME'];
 const TRELLIS_BIN_ENV = 'TRELLIS_BINARY';
@@ -662,16 +662,17 @@ function makeWorkerId(mode, taskDir, scope, extraInstructions) {
 function seedPiAgentConfig(targetPiHome) {
   const srcDir = path.join(os.homedir(), '.pi', 'agent');
   const required = ['models.json', 'settings.json'];
-  let copied = 0;
+  const copied = [];
   for (const f of required) {
     const src = path.join(srcDir, f);
     if (fs.existsSync(src)) {
       fs.mkdirSync(targetPiHome, { recursive: true });
-      fs.copyFileSync(src, path.join(targetPiHome, f));
-      copied++;
+      const dest = path.join(targetPiHome, f);
+      fs.copyFileSync(src, dest);
+      copied.push({ source: src, destination: dest });
     }
   }
-  return copied;
+  return { count: copied.length, files: copied };
 }
 
 function createWorkerRuntime(runtimeDir, workerId) {
@@ -681,11 +682,11 @@ function createWorkerRuntime(runtimeDir, workerId) {
   const sessionDir = path.join(workerDir, 'sessions');
   fs.mkdirSync(piHome, { recursive: true });
   fs.mkdirSync(sessionDir, { recursive: true });
-  const configFiles = seedPiAgentConfig(piHome);
-  if (configFiles === 0) {
+  const seed = seedPiAgentConfig(piHome);
+  if (seed.count === 0) {
     console.error(`[${SERVER_NAME}] WARNING: no Pi agent config files found in ~/.pi/agent/; Pi subprocess may fail with "Model not found"`);
   }
-  return { workerId, workerDir, repoDir, piHome, sessionDir, configFiles };
+  return { workerId, workerDir, repoDir, piHome, sessionDir, configFiles: seed.count, configFilePaths: seed.files };
 }
 
 function createWorktree(sourceDir, repoDir) {
@@ -885,6 +886,97 @@ function buildRecommendedCommands({ applyCommand, validationCommands = [] }) {
 
 function writeJsonFile(filePath, data) {
   fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`, 'utf-8');
+}
+
+function formatBlock(label, value, maxLen = 4000) {
+  const text = String(value || '').trim();
+  if (!text) return `${label}: (empty)`;
+  const truncated = text.length > maxLen ? `${text.slice(0, maxLen)}\n...[truncated ${text.length - maxLen} chars]` : text;
+  return `${label}:\n${truncated}`;
+}
+
+function formatSeededConfig(seed) {
+  if (!seed || !Array.isArray(seed.files) || seed.files.length === 0) return 'config_seeded: none';
+  const lines = ['config_seeded:'];
+  for (const file of seed.files) {
+    lines.push(`  - ${file.destination} (from ${file.source})`);
+  }
+  return lines.join('\n');
+}
+
+function safeSmokeEnv(env) {
+  const keys = [
+    'PI_CODING_AGENT_DIR',
+    'PI_CODING_AGENT_SESSION_DIR',
+    'PI_OFFLINE',
+    'PI_SKIP_VERSION_CHECK',
+    'PI_BINARY',
+  ];
+  const out = {};
+  for (const key of keys) {
+    if (env[key] !== undefined) out[key] = env[key];
+  }
+  return out;
+}
+
+function formatSmokeEnv(env) {
+  const entries = Object.entries(env);
+  if (entries.length === 0) return 'env_passed: (none)';
+  return `env_passed:\n${entries.map(([k, v]) => `  ${k}=${v}`).join('\n')}`;
+}
+
+function smokeDiagnostic(stdout, stderr, seed) {
+  const combined = `${stdout || ''}\n${stderr || ''}`;
+  if (/model .*not found|unknown model|no model/i.test(combined)) {
+    if (!seed || seed.count === 0) {
+      return 'diagnostic: no Pi agent config files were seeded; check ~/.pi/agent/models.json and ~/.pi/agent/settings.json.';
+    }
+    return 'diagnostic: model routing failed despite seeded Pi agent config; check the configured model route and Pi model registry.';
+  }
+  if (/permission|denied|approval|tty|stdin/i.test(combined)) {
+    return 'diagnostic: Pi appears blocked by non-interactive execution or permissions.';
+  }
+  return 'diagnostic: inspect pi stderr/stdout above and run the same model with the pi CLI if needed.';
+}
+
+function dirSizeBytes(dir) {
+  let total = 0;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    try {
+      if (entry.isDirectory()) total += dirSizeBytes(full);
+      else if (entry.isFile() || entry.isSymbolicLink()) total += fs.lstatSync(full).size;
+    } catch {}
+  }
+  return total;
+}
+
+function runtimeWorkersDir(runtimeDir) {
+  const base = path.basename(runtimeDir);
+  if (base.startsWith('pi-') && fs.existsSync(path.join(runtimeDir, 'report.json'))) return path.dirname(runtimeDir);
+  if (base === 'pi-workers') return runtimeDir;
+  return path.join(runtimeDir, 'pi-workers');
+}
+
+function removeWorkerRuntime(workerDir, workDir) {
+  const repoDir = path.join(workerDir, 'repo');
+  if (fs.existsSync(repoDir)) {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', repoDir], {
+        cwd: workDir,
+        encoding: 'utf-8',
+        timeout: 30000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch {}
+  }
+  fs.rmSync(workerDir, { recursive: true, force: true });
 }
 
 // ---- Tool implementations ----
@@ -1317,8 +1409,18 @@ function smoke(args) {
   const { env: piEnv } = buildPiEnv(process.env);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-smoke-'));
   const isolatedHome = path.join(tmpDir, 'pi-home');
+  const sessionDir = path.join(tmpDir, 'sessions');
   fs.mkdirSync(isolatedHome, { recursive: true });
-  const configFiles = seedPiAgentConfig(isolatedHome);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const seed = seedPiAgentConfig(isolatedHome);
+  const childEnv = {
+    ...piEnv,
+    PI_CODING_AGENT_DIR: isolatedHome,
+    PI_CODING_AGENT_SESSION_DIR: sessionDir,
+    PI_OFFLINE: '1',
+    PI_SKIP_VERSION_CHECK: '1',
+  };
+  const safeEnv = safeSmokeEnv(childEnv);
 
   return new Promise((resolve) => {
     const proc = trackChild(spawn(piBin, [
@@ -1327,12 +1429,7 @@ function smoke(args) {
       '-p', 'Respond with exactly the string: PI READY. No other words.',
     ], {
       cwd: working_directory || process.cwd(),
-      env: {
-        ...piEnv,
-        PI_CODING_AGENT_DIR: isolatedHome,
-        PI_OFFLINE: '1',
-        PI_SKIP_VERSION_CHECK: '1',
-      },
+      env: childEnv,
       // Pi's -p mode blocks on stdin EOF if stdin is a live pipe.
       stdio: ['ignore', 'pipe', 'pipe'],
     }));
@@ -1359,15 +1456,22 @@ function smoke(args) {
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
     proc.on('close', (code, signal) => {
       const ready = stdout.includes('PI READY');
-      let text = `Pi smoke: ${ready ? 'PASSED' : 'FAILED'} | model=${model} (${modelFrom}${modelKey ? `:${modelKey}` : ''}) | exit=${code} | signal=${signal || 'none'} | killed=${killed} | config_seeded=${configFiles}`;
-      text += `\nOutput: ${(stdout || stderr).trim().slice(0, 500)}`;
+      let text = `Pi smoke: ${ready ? 'PASSED' : 'FAILED'} | model=${model} (${modelFrom}${modelKey ? `:${modelKey}` : ''}) | exit=${code} | signal=${signal || 'none'} | killed=${killed}`;
+      text += `\n${formatSeededConfig(seed)}`;
+      text += `\n${formatSmokeEnv(safeEnv)}`;
+      text += `\n${formatBlock('pi stdout', stdout)}`;
+      text += `\n${formatBlock('pi stderr', stderr)}`;
+      if (!ready) text += `\n${smokeDiagnostic(stdout, stderr, seed)}`;
       finish({
         content: [{ type: 'text', text }],
         isError: !ready,
       });
     });
     proc.on('error', (err) => {
-      finish({ content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true });
+      let text = `Pi smoke: FAILED | model=${model} (${modelFrom}${modelKey ? `:${modelKey}` : ''}) | spawn_error=${err.message}`;
+      text += `\n${formatSeededConfig(seed)}`;
+      text += `\n${formatSmokeEnv(safeEnv)}`;
+      finish({ content: [{ type: 'text', text }], isError: true });
     });
   });
 }
@@ -1466,6 +1570,70 @@ function readReport(args) {
   } catch (e) {
     return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true };
   }
+}
+
+function cleanupRuntime(args) {
+  const {
+    working_directory,
+    retain_days = 7,
+    dry_run = false,
+  } = args;
+  const workDir = working_directory || process.cwd();
+  const runtimeDir = resolveRuntimeDir(workDir);
+  const workersDir = runtimeWorkersDir(runtimeDir);
+  const retainMs = Math.max(0, Number(retain_days) || 0) * 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - retainMs;
+
+  if (!fs.existsSync(workersDir)) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ runtime_dir: runtimeDir, workers_dir: workersDir, dry_run, removed: [], retained: [], bytes_freed: 0 }, null, 2),
+      }],
+    };
+  }
+
+  const removed = [];
+  const retained = [];
+  let bytesFreed = 0;
+  const entries = fs.readdirSync(workersDir, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && entry.name.startsWith('pi-'));
+
+  for (const entry of entries) {
+    const dir = path.join(workersDir, entry.name);
+    let stat;
+    try {
+      stat = fs.statSync(dir);
+    } catch {
+      continue;
+    }
+    const bytes = dirSizeBytes(dir);
+    const item = {
+      worker_id: entry.name,
+      path: dir,
+      mtime: stat.mtime.toISOString(),
+      bytes,
+    };
+    if (stat.mtimeMs < cutoff) {
+      removed.push(item);
+      bytesFreed += bytes;
+      if (!dry_run) removeWorkerRuntime(dir, workDir);
+    } else {
+      retained.push(item);
+    }
+  }
+
+  const result = {
+    runtime_dir: runtimeDir,
+    workers_dir: workersDir,
+    retain_days: Number(retain_days),
+    dry_run: Boolean(dry_run),
+    removed,
+    retained,
+    bytes_freed: dry_run ? 0 : bytesFreed,
+    bytes_would_free: dry_run ? bytesFreed : undefined,
+  };
+  return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 }
 
 function previewPrompt(args) {
@@ -1573,6 +1741,18 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'cleanup_runtime',
+    description: 'Prune old Pi worker runtime directories under .trellis/.runtime/pi-workers or /tmp/pi-adapter/pi-workers.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        working_directory: { type: 'string', description: 'Repo root. Defaults to cwd. Trellis repos use .trellis/.runtime; standalone repos use /tmp/pi-adapter.' },
+        retain_days: { type: 'number', default: 7, description: 'Remove worker directories older than this many days. Default 7.' },
+        dry_run: { type: 'boolean', default: false, description: 'When true, only reports what would be removed.' },
+      },
+    },
+  },
 ];
 
 // ---- MCP server ----
@@ -1592,6 +1772,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     case 'preview_prompt': return previewPrompt(args);
     case 'smoke':          return await smoke(args);
     case 'read_report':    return readReport(args);
+    case 'cleanup_runtime': return cleanupRuntime(args);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 });

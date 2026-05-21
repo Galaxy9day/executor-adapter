@@ -27,6 +27,10 @@ if (scenario === 'diff') {
 } else if (scenario === 'required-missing') {
   write('actual.txt', 'actual change\n');
   console.log('Files modified: actual.txt');
+} else if (scenario === 'smoke-fail') {
+  console.log('fake pi starting');
+  console.error('Error: Model "fake/model" not found. Use --list-models to see available models.');
+  process.exit(1);
 } else {
   console.error(`Unknown FAKE_PI_SCENARIO: ${scenario}`);
   process.exit(2);
