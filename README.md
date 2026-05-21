@@ -119,7 +119,7 @@ Assemble context, run Pi, optionally emit channel events, run post-validation, r
   "validation_scope": "static/auto validation passed; data validation must run in main repo",
   "data_validation": "not_attempted",
   "data_validation_reason": "Derived/generated data was unavailable in the isolated worker; run data validation in the main repository after applying the patch.",
-  "project_mode": "trellis",
+  "project_mode": "trellis_local_worktree",
   "apply_command": "git apply \"/path/to/diff.patch\"",
   "orchestrator_next_steps": [
     "Inspect report.json and diff.patch",
@@ -142,6 +142,8 @@ Assemble context, run Pi, optionally emit channel events, run post-validation, r
 `blocked` is reserved for runs where Pi cannot continue and no apply-ready patch is available. When Pi exits 0 with a non-empty patch and post-validation passes, but isolated worktree data validation is unavailable, the adapter returns `patch_ready_limited_validation` instead of `blocked`.
 
 The dispatch response intentionally does not inline Pi's long stdout/stderr. It returns summary fields and artifact paths; use `read_report` when you need the log tail.
+
+`project_mode` is one of `trellis_channel_bridge`, `trellis_local_worktree`, `standalone_worktree`, or `standalone`.
 
 ### `preview_prompt(...)`
 

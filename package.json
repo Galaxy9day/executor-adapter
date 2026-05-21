@@ -1,6 +1,6 @@
 {
   "name": "@galaxy9day/pi-adapter",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Pi (GPT-5.5) executor MCP for Trellis-aware and standalone use. Reads Trellis task artifacts, runs Pi in an isolated subprocess/worktree, and can optionally emit non-invasive Trellis channel audit messages.",
   "type": "module",
   "main": "index.js",

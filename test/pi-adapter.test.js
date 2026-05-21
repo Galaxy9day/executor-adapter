@@ -124,7 +124,7 @@ test('Trellis project without channel returns patch-ready report', async () => {
     });
     assert.equal(result.isError, false);
     const report = readReport(result);
-    assert.equal(report.project_mode, 'trellis');
+    assert.equal(report.project_mode, 'trellis_local_worktree');
     assert.equal(report.result_class, 'patch_ready');
     assert.equal(report.status, 'done');
     assert.match(report.report_file, /\.trellis\/\.runtime\/pi-workers/);
@@ -150,7 +150,7 @@ test('Trellis channel mode degrades gracefully when channel delivery is unavaila
     });
     assert.equal(result.isError, false);
     const report = readReport(result);
-    assert.equal(report.project_mode, 'trellis');
+    assert.equal(report.project_mode, 'trellis_channel_bridge');
     assert.equal(report.result_class, 'patch_ready');
   } finally {
     mcp.close();
@@ -172,9 +172,30 @@ test('standalone project without Trellis works in worktree mode', async () => {
     });
     assert.equal(result.isError, false);
     const report = readReport(result);
-    assert.equal(report.project_mode, 'standalone');
+    assert.equal(report.project_mode, 'standalone_worktree');
     assert.equal(report.result_class, 'patch_ready');
     assert.match(report.report_file, /pi-adapter\/pi-workers/);
+  } finally {
+    mcp.close();
+  }
+});
+
+test('preview_prompt supports standalone implement mode with explicit instructions', async () => {
+  const repo = makeRepo();
+  const mcp = startMcp();
+  try {
+    await mcp.init();
+    const result = await mcp.callTool('preview_prompt', {
+      mode: 'implement',
+      execution_mode: 'worktree',
+      working_directory: repo,
+      extra_instructions: 'Update README.md.',
+      scope: 'Only README.md',
+    });
+    assert.equal(result.isError, undefined);
+    assert.match(result.content[0].text, /Pi Dispatch: Implementation \(no Trellis\)/);
+    assert.match(result.content[0].text, /Update README\.md/);
+    assert.match(result.content[0].text, /Only README\.md/);
   } finally {
     mcp.close();
   }
@@ -291,7 +312,7 @@ test('read_report summarizes Trellis and standalone runtime reports', async () =
       lines: 5,
     });
     assert.match(trellisSummary.content[0].text, /result_class: patch_ready/);
-    assert.match(trellisSummary.content[0].text, /project_mode: trellis/);
+    assert.match(trellisSummary.content[0].text, /project_mode: trellis_local_worktree/);
     assert.match(trellisSummary.content[0].text, /apply_command:/);
 
     const standaloneResult = await mcp.callTool('dispatch', {
@@ -309,7 +330,7 @@ test('read_report summarizes Trellis and standalone runtime reports', async () =
       lines: 5,
     });
     assert.match(standaloneSummary.content[0].text, /result_class: patch_ready/);
-    assert.match(standaloneSummary.content[0].text, /project_mode: standalone/);
+    assert.match(standaloneSummary.content[0].text, /project_mode: standalone_worktree/);
     assert.match(standaloneSummary.content[0].text, /changed_files/);
   } finally {
     mcp.close();

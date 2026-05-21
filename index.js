@@ -42,7 +42,7 @@ import * as crypto from 'node:crypto';
 // ---- Constants ----
 
 const SERVER_NAME = 'pi-adapter';
-const SERVER_VERSION = '0.1.7';  // keep in sync with package.json
+const SERVER_VERSION = '0.1.8';  // keep in sync with package.json
 const TMP_RUNTIME_DIR = path.join(os.tmpdir(), SERVER_NAME);
 const CHANNEL_ENV_ALIASES = ['TRELLIS_CHANNEL', 'TRELLIS_CHANNEL_NAME'];
 const TRELLIS_BIN_ENV = 'TRELLIS_BINARY';
@@ -86,8 +86,11 @@ function resolveRuntimeDir(workDir) {
   return TMP_RUNTIME_DIR;
 }
 
-function detectProjectMode(workDir) {
-  return fs.existsSync(path.join(workDir, '.trellis')) ? 'trellis' : 'standalone';
+function detectProjectMode(workDir, channelName, executionMode) {
+  if (fs.existsSync(path.join(workDir, '.trellis'))) {
+    return channelName ? 'trellis_channel_bridge' : 'trellis_local_worktree';
+  }
+  return executionMode === 'worktree' ? 'standalone_worktree' : 'standalone';
 }
 
 function isGitRepo(workDir) {
@@ -851,7 +854,7 @@ function buildOrchestratorNextSteps({ resultClass, projectMode, applyCommand, va
     return ['Inspect report/log', 'Fix the blocker', 'Re-dispatch when the task can continue'];
   }
 
-  const checkStep = projectMode === 'trellis'
+  const checkStep = projectMode.startsWith('trellis_')
     ? 'Run independent check/trellis-check'
     : 'Run independent review/check';
   const steps = [
@@ -911,7 +914,6 @@ async function dispatch(args) {
 
   const timeout_minutes = Math.min(timeoutInput, 120);
   const workDir = cwd || process.cwd();
-  const projectMode = detectProjectMode(workDir);
   const executionMode = executionModeInput || defaultExecutionMode(mode);
   const tools = toolsInput || defaultToolsForExecution(executionMode);
   if (!['review', 'patch', 'worktree', 'direct'].includes(executionMode)) {
@@ -921,6 +923,7 @@ async function dispatch(args) {
     return { content: [{ type: 'text', text: `Error: execution_mode=worktree requires a git repository: ${workDir}` }], isError: true };
   }
   const channelName = detectChannel(args, process.env);
+  const projectMode = detectProjectMode(workDir, channelName, executionMode);
   let model, modelFrom, modelKey;
   try {
     ({ resolved: model, from: modelFrom, key: modelKey } = resolveModel(modelInput, mode));
@@ -1480,7 +1483,9 @@ function previewPrompt(args) {
   const workDir = cwd || process.cwd();
   const executionMode = executionModeInput || defaultExecutionMode(mode);
   let taskDir = explicitTaskDir || resolveActiveTask(workDir, trellis_context_id);
-  if (!taskDir && mode !== 'custom') return { content: [{ type: 'text', text: 'No active Trellis task found. Provide task_dir, trellis_context_id, or use custom mode with extra_instructions.' }], isError: true };
+  if (!taskDir && mode !== 'custom' && !extra_instructions) {
+    return { content: [{ type: 'text', text: 'No active Trellis task found. Provide task_dir, trellis_context_id, use custom mode, or provide extra_instructions for standalone preview.' }], isError: true };
+  }
 
   let body;
   if (taskDir) {
