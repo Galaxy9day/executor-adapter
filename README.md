@@ -14,6 +14,7 @@ When Trellis is present, this MCP reads Trellis task artifacts and can optionall
 - Reads Trellis task artifacts (`prd.md`, `design.md`, `implement.md`, `implement.jsonl` / `check.jsonl`) and assembles a Pi-ready prompt.
 - Spawns Pi with sanitised environment (credential-shaped vars are stripped before inheritance).
 - Defaults implementation/custom dispatches to an isolated git worktree under `.trellis/.runtime/pi-workers/<worker-id>/`, then exports `diff.patch` and `report.json` for the orchestrator to review/apply.
+- Classifies patch-ready limited-validation runs distinctly from true blockers, so orchestrators can continue main-repo validation without reading the full Pi log.
 - Defaults check dispatches to read-only review mode (`read,grep,find,ls`) so Pi can supplement quality review without mutating the repo.
 - In channel mode: emits best-effort bookend audit messages into the Trellis channel via `@mindfoldhq/trellis-core`'s `sendMessage`.
 - Runs post-execution validation against `git diff` (`min_files_changed`, `required_paths_modified`, `forbidden_paths`, `min_diff_lines`) — catches "exit 0 + no useful work" failures before the orchestrator sees them.
@@ -88,6 +89,7 @@ Assemble context, run Pi, optionally emit channel events, run post-validation, r
 | `dry_run` | boolean | Build prompt without launching Pi. |
 | `extra_instructions` | string | Additional prompt text appended after assembled context. |
 | `scope` | string | File/path constraints communicated to Pi. |
+| `context_files` | string[] | Optional extra files to embed in the prompt. Contents are included only when explicitly requested. |
 | `trellis_context_id` | string | Optional Trellis session/context id. Passed as `TRELLIS_CONTEXT_ID` when auto-resolving the active task. |
 | `validation_commands` | string[] | Commands Pi runs before reporting done. |
 | `channel` | string | Trellis channel name. Overrides `TRELLIS_CHANNEL` / `TRELLIS_CHANNEL_NAME` env. |
@@ -105,6 +107,42 @@ Assemble context, run Pi, optionally emit channel events, run post-validation, r
 
 `worktree` prompts embed Trellis manifest files and task artifacts so Pi can run from a clean checkout even when task files are uncommitted in the main worktree.
 
+#### Result classes and report fields
+
+`report.json` and the MCP return include short structured fields for the orchestrator:
+
+```json
+{
+  "status": "patch_ready_limited_validation",
+  "result_class": "patch_ready_limited_validation",
+  "status_reason": "Pi produced a non-empty patch and static/auto validation passed, but data validation was not available in the isolated worktree.",
+  "validation_scope": "static/auto validation passed; data validation must run in main repo",
+  "data_validation": "not_attempted",
+  "data_validation_reason": "Derived/generated data was unavailable in the isolated worker; run data validation in the main repository after applying the patch.",
+  "project_mode": "trellis",
+  "apply_command": "git apply \"/path/to/diff.patch\"",
+  "orchestrator_next_steps": [
+    "Inspect report.json and diff.patch",
+    "Apply patch: git apply \"/path/to/diff.patch\"",
+    "Run cheap validation",
+    "Run sample/small validation",
+    "Run independent check/trellis-check",
+    "If check changes code, re-run sample/small validation",
+    "Run expensive full validation",
+    "Commit only from the orchestrator after validation passes"
+  ],
+  "recommended_main_repo_commands": [
+    "git apply \"/path/to/diff.patch\"",
+    "git status --short",
+    "git diff --stat"
+  ]
+}
+```
+
+`blocked` is reserved for runs where Pi cannot continue and no apply-ready patch is available. When Pi exits 0 with a non-empty patch and post-validation passes, but isolated worktree data validation is unavailable, the adapter returns `patch_ready_limited_validation` instead of `blocked`.
+
+The dispatch response intentionally does not inline Pi's long stdout/stderr. It returns summary fields and artifact paths; use `read_report` when you need the log tail.
+
 ### `preview_prompt(...)`
 
 Same args as `dispatch` (subset). Renders the prompt without launching Pi.
@@ -113,9 +151,9 @@ Same args as `dispatch` (subset). Renders the prompt without launching Pi.
 
 One-shot connectivity test. Verifies Pi binary is on PATH and the resolved model answers a trivial round-trip.
 
-### `read_report({ log_file, lines? })`
+### `read_report({ log_file?, report_file?, runtime_dir?, worker_id?, lines? })`
 
-Reads the tail of a Pi output log (produced by `dispatch`).
+Reads `report.json` when available and prints a short summary first: `result_class`, `project_mode`, `changed_files`, `apply_command`, next steps, and recommended commands. It can resolve both Trellis runtime directories (`.trellis/.runtime/pi-workers/<worker-id>/`) and standalone runtime directories (`/tmp/pi-adapter/pi-workers/<worker-id>/`). Log tail output remains available via `lines`.
 
 ## Channel mode
 
@@ -168,12 +206,17 @@ The metaResponse line `Env: scrubbed N sensitive vars` confirms scrubbing fired.
 
 Auto-validation catches obvious failures. The orchestrator should still:
 
-1. Read Pi's structured report (file list, test output, leftover TODOs)
-2. Run tests independently (don't trust Pi's `exit 0`)
-3. Inspect `git diff`
-4. Spot-check spec compliance against PRD acceptance criteria
-5. Smoke test the actual feature end-to-end
-6. Log decisions Pi made outside spec
+1. Dispatch Pi in `worktree` mode.
+2. Inspect `report.json` and `diff.patch`.
+3. Apply the patch if acceptable.
+4. Run cheap validation.
+5. Run sample/small validation.
+6. Run independent check / `trellis-check`.
+7. If the check modifies code, re-run sample/small validation.
+8. Run expensive full validation.
+9. Commit only from the orchestrator after validation passes.
+
+Do not start expensive full validation before independent check work that may modify code; a check fix invalidates the full run.
 
 See [the body of the SKILL.md](./SKILL.md) (when used with the matching [coworkers](https://github.com/Galaxy9day/coworkers) skill) for the full protocol.
 

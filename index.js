@@ -42,7 +42,7 @@ import * as crypto from 'node:crypto';
 // ---- Constants ----
 
 const SERVER_NAME = 'pi-adapter';
-const SERVER_VERSION = '0.1.6';  // keep in sync with package.json
+const SERVER_VERSION = '0.1.7';  // keep in sync with package.json
 const TMP_RUNTIME_DIR = path.join(os.tmpdir(), SERVER_NAME);
 const CHANNEL_ENV_ALIASES = ['TRELLIS_CHANNEL', 'TRELLIS_CHANNEL_NAME'];
 const TRELLIS_BIN_ENV = 'TRELLIS_BINARY';
@@ -84,6 +84,10 @@ function resolveRuntimeDir(workDir) {
     return path.join(workDir, '.trellis', '.runtime');
   }
   return TMP_RUNTIME_DIR;
+}
+
+function detectProjectMode(workDir) {
+  return fs.existsSync(path.join(workDir, '.trellis')) ? 'trellis' : 'standalone';
 }
 
 function isGitRepo(workDir) {
@@ -438,6 +442,27 @@ function fencedContent(label, content) {
   return `### ${label}\n\n~~~text\n${String(content || '')}\n~~~\n\n`;
 }
 
+function readContextFiles(repoRoot, contextFiles) {
+  const files = [];
+  if (!Array.isArray(contextFiles)) return files;
+  for (const filePath of contextFiles) {
+    if (typeof filePath !== 'string' || !filePath.trim()) continue;
+    const rel = filePath.trim();
+    const abs = path.isAbsolute(rel) ? rel : path.join(repoRoot, rel);
+    const content = readFile(abs);
+    if (content !== null) files.push({ path: rel, content });
+  }
+  return files;
+}
+
+function appendContextFilesPrompt(prompt, contextFiles) {
+  if (!Array.isArray(contextFiles) || contextFiles.length === 0) return prompt;
+  let p = prompt;
+  p += `\n## Additional Context Files\n\n`;
+  for (const f of contextFiles) p += fencedContent(f.path, f.content);
+  return p;
+}
+
 function buildDispatchPrompt(args) {
   const { taskDir, artifacts, manifest, manifestFile, mode } = args;
   const executionMode = args.execution_mode || defaultExecutionMode(mode);
@@ -473,6 +498,7 @@ function buildDispatchPrompt(args) {
     for (const [name, content] of Object.entries(artifacts)) p += fencedContent(`${taskDir}/${name}`, content);
   }
 
+  p = appendContextFilesPrompt(p, args.context_files);
   if (scopeConstraint)        p += `\n## Scope Constraint\n\n${scopeConstraint}\n\n`;
   if (extraInstructions)      p += `\n## Additional Instructions\n\n${extraInstructions}\n\n`;
   if (executionMode === 'worktree') {
@@ -490,7 +516,7 @@ function buildDispatchPrompt(args) {
   return p;
 }
 
-function buildNoTrellisPrompt(mode, extraInstructions, scope, validationCommands, executionMode = defaultExecutionMode(mode)) {
+function buildNoTrellisPrompt(mode, extraInstructions, scope, validationCommands, executionMode = defaultExecutionMode(mode), contextFiles = []) {
   const modeLabel = mode === 'check' ? 'Quality Check' : mode === 'custom' ? 'Custom' : 'Implementation';
   let p = `# Pi Dispatch: ${modeLabel} (no Trellis)\n\n`;
   if (mode === 'implement') {
@@ -501,6 +527,7 @@ function buildNoTrellisPrompt(mode, extraInstructions, scope, validationCommands
     p += `You are a Pi worker. The orchestrator will review your output.\n\n**Guards**:\n- Do NOT git commit.\n- Do NOT spawn other agents.\n\n`;
   }
   p += `## Task\n\n${extraInstructions}\n\n`;
+  p = appendContextFilesPrompt(p, contextFiles);
   if (scope) p += `## Scope Constraint\n\n${scope}\n\n`;
   if (executionMode === 'worktree') {
     p += `## Execution Environment\n\nYou are running inside an isolated git worktree. Modify files there normally. The orchestrator will export your changes as a patch, review it, and decide whether to apply it to the main repository. Do not commit.\n\n`;
@@ -720,6 +747,139 @@ function classifyRunStatus(exitCode, killed, output) {
   return exitCode === 0 ? 'done' : 'failed';
 }
 
+function hasUsablePatch(executionMode, diffInfo, changedFiles) {
+  if (executionMode !== 'worktree') return false;
+  return Boolean(diffInfo && diffInfo.ok && Array.isArray(changedFiles) && changedFiles.length > 0);
+}
+
+function detectsDataValidationUnavailable(output) {
+  const text = output || '';
+  return [
+    /(derived|generated|sample|full|fixture|data).{0,100}(missing|unavailable|not available|not found|cannot|can't|unable|skipped|not attempted)/i,
+    /(cannot|can't|unable|skipped|not attempted).{0,100}(sample|full|data|validation|derived|generated)/i,
+    /data validation.{0,100}(must|needs?).{0,60}main repo/i,
+  ].some((re) => re.test(text));
+}
+
+function validationScopeText(validation, limitedDataValidation) {
+  if (!validation || validation.skipped) {
+    return limitedDataValidation
+      ? 'auto validation skipped; data validation must run in main repo'
+      : 'auto validation skipped; orchestrator validation required';
+  }
+  if (validation.passed) {
+    return limitedDataValidation
+      ? 'static/auto validation passed; data validation must run in main repo'
+      : 'static/auto validation passed; orchestrator validation required';
+  }
+  return 'auto validation failed';
+}
+
+function classifyResult({ executionMode, status, finalStatus, exitCode, validation, diffInfo, changedFiles, output }) {
+  const usablePatch = hasUsablePatch(executionMode, diffInfo, changedFiles);
+  const limitedDataValidation = usablePatch && validation?.passed && exitCode === 0 && detectsDataValidationUnavailable(output);
+
+  if (limitedDataValidation && (status === 'done' || status === 'blocked')) {
+    return {
+      status: 'patch_ready_limited_validation',
+      result_class: 'patch_ready_limited_validation',
+      status_reason: 'Pi produced a non-empty patch and static/auto validation passed, but data validation was not available in the isolated worktree.',
+      data_validation: 'not_attempted',
+      data_validation_reason: 'Derived/generated data was unavailable in the isolated worker; run data validation in the main repository after applying the patch.',
+    };
+  }
+
+  if (executionMode === 'worktree' && diffInfo?.ok && changedFiles.length === 0) {
+    return {
+      status: 'no_patch',
+      result_class: 'no_usable_patch',
+      status_reason: 'Pi exited without producing changes in diff.patch.',
+      data_validation: 'not_attempted',
+      data_validation_reason: 'No patch was produced, so main-repository data validation is not applicable yet.',
+    };
+  }
+
+  if (!validation?.passed) {
+    return {
+      status: 'validation_failed',
+      result_class: 'validation_failed',
+      status_reason: 'Post-execution validation failed.',
+      data_validation: 'not_attempted',
+      data_validation_reason: 'Main-repository data validation should wait until post-validation failures are resolved.',
+    };
+  }
+
+  if (executionMode === 'worktree' && usablePatch && finalStatus === 'done') {
+    return {
+      status: 'done',
+      result_class: 'patch_ready',
+      status_reason: 'Pi produced a non-empty patch and post-validation passed.',
+      data_validation: 'not_attempted',
+      data_validation_reason: 'Worktree dispatch does not prove main-repository data validation; run it after applying the patch.',
+    };
+  }
+
+  if (finalStatus === 'done') {
+    return {
+      status: 'done',
+      result_class: 'completed',
+      status_reason: 'Pi completed and post-validation passed.',
+      data_validation: 'not_attempted',
+      data_validation_reason: 'No adapter-level data validation result was captured.',
+    };
+  }
+
+  return {
+    status: finalStatus,
+    result_class: finalStatus === 'blocked' ? 'blocked' : 'failed',
+    status_reason: finalStatus === 'blocked'
+      ? 'Pi could not continue and did not produce an apply-ready patch.'
+      : 'Pi did not complete successfully.',
+    data_validation: 'not_attempted',
+    data_validation_reason: 'Main-repository data validation should wait until dispatch succeeds.',
+  };
+}
+
+function buildOrchestratorNextSteps({ resultClass, projectMode, applyCommand, validationCommands = [] }) {
+  if (resultClass === 'no_usable_patch') {
+    return ['Inspect report/log', 'Tighten scope or instructions', 'Re-dispatch or fix manually'];
+  }
+  if (resultClass === 'validation_failed') {
+    return ['Inspect report/diff', 'Resolve post-validation failures', 'Re-run cheap validation before apply'];
+  }
+  if (resultClass === 'blocked' || resultClass === 'failed') {
+    return ['Inspect report/log', 'Fix the blocker', 'Re-dispatch when the task can continue'];
+  }
+
+  const checkStep = projectMode === 'trellis'
+    ? 'Run independent check/trellis-check'
+    : 'Run independent review/check';
+  const steps = [
+    'Inspect report.json and diff.patch',
+    applyCommand ? `Apply patch: ${applyCommand}` : 'Apply accepted changes',
+    'Run cheap validation',
+    'Run sample/small validation',
+    checkStep,
+    'If check changes code, re-run sample/small validation',
+    'Run expensive full validation',
+    'Commit only from the orchestrator after validation passes',
+  ];
+  if (validationCommands.length > 0) {
+    steps.splice(3, 0, 'Run requested validation_commands in the main repository');
+  }
+  return steps;
+}
+
+function buildRecommendedCommands({ applyCommand, validationCommands = [] }) {
+  const commands = [];
+  if (applyCommand) commands.push(applyCommand);
+  commands.push('git status --short', 'git diff --stat');
+  for (const cmd of validationCommands) {
+    if (typeof cmd === 'string' && cmd.trim()) commands.push(cmd.trim());
+  }
+  return [...new Set(commands)];
+}
+
 function writeJsonFile(filePath, data) {
   fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`, 'utf-8');
 }
@@ -740,6 +900,7 @@ async function dispatch(args) {
     dry_run = false,
     extra_instructions,
     scope,
+    context_files,
     trellis_context_id,
     validation_commands = [],
     min_files_changed,
@@ -750,6 +911,7 @@ async function dispatch(args) {
 
   const timeout_minutes = Math.min(timeoutInput, 120);
   const workDir = cwd || process.cwd();
+  const projectMode = detectProjectMode(workDir);
   const executionMode = executionModeInput || defaultExecutionMode(mode);
   const tools = toolsInput || defaultToolsForExecution(executionMode);
   if (!['review', 'patch', 'worktree', 'direct'].includes(executionMode)) {
@@ -785,10 +947,10 @@ async function dispatch(args) {
   let promptBody = '';
   if (taskDir) {
     context = assembleTrellisContext(workDir, taskDir, mode);
-    promptBody = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands });
+    promptBody = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands, context_files: readContextFiles(workDir, context_files) });
   } else if (mode === 'custom') {
     if (!extra_instructions) return { content: [{ type: 'text', text: 'Error: custom mode requires extra_instructions.' }], isError: true };
-    promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode);
+    promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode, readContextFiles(workDir, context_files));
   } else {
     if (!extra_instructions) {
       return {
@@ -796,7 +958,7 @@ async function dispatch(args) {
         isError: true,
       };
     }
-    promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode);
+    promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode, readContextFiles(workDir, context_files));
   }
 
   const runtimeDir = resolveRuntimeDir(workDir);
@@ -823,6 +985,7 @@ async function dispatch(args) {
   metaResponse += `Log: ${logPath}\n`;
   metaResponse += `Report: ${reportPath}\n`;
   metaResponse += `Worker: ${workerId} (${executionMode})\n`;
+  metaResponse += `Project mode: ${projectMode}\n`;
   if (executionMode === 'worktree') {
     metaResponse += `Worker repo: ${worker.repoDir}\n`;
     metaResponse += `Patch: ${patchPath}\n`;
@@ -874,6 +1037,14 @@ async function dispatch(args) {
       writeJsonFile(reportPath, {
         worker_id: workerId,
         status: 'spawn_error',
+        result_class: 'failed',
+        status_reason: 'Could not create isolated git worktree.',
+        validation_scope: 'not run',
+        data_validation: 'not_attempted',
+        data_validation_reason: 'Dispatch did not start.',
+        orchestrator_next_steps: ['Inspect error', 'Fix worktree setup', 'Re-dispatch'],
+        recommended_main_repo_commands: ['git status --short'],
+        project_mode: projectMode,
         error: e.message,
         execution_mode: executionMode,
         prompt_file: promptPath,
@@ -976,15 +1147,42 @@ async function dispatch(args) {
       if (killed) output += `\n\n[PROCESS KILLED: exceeded ${timeout_minutes} minute timeout]`;
       if (signaled && !killed) output += `\n\n[PROCESS EXITED BY SIGNAL: ${signal}]`;
 
-      const status = signaled ? 'killed' : classifyRunStatus(exitCode, killed, output);
+      const runStatus = signaled ? 'killed' : classifyRunStatus(exitCode, killed, output);
       const changedFiles = validation.changedFiles || diffInfo?.changedFiles || [];
-      const ok = status === 'done' && validation.passed && (!diffInfo || diffInfo.ok);
+      const ok = runStatus === 'done' && validation.passed && (!diffInfo || diffInfo.ok) && !(executionMode === 'worktree' && diffInfo?.ok && changedFiles.length === 0);
       const finalStatus = ok
         ? 'done'
-        : (!validation.passed ? 'validation_failed' : (diffInfo && !diffInfo.ok ? 'diff_failed' : status));
+        : (!validation.passed ? 'validation_failed' : (diffInfo && !diffInfo.ok ? 'diff_failed' : runStatus));
+      const result = classifyResult({
+        executionMode,
+        status: runStatus,
+        finalStatus,
+        exitCode,
+        validation,
+        diffInfo,
+        changedFiles,
+        output,
+      });
+      const applyCommand = executionMode === 'worktree' ? `git apply "${patchPath}"` : null;
+      const recommendedCommands = buildRecommendedCommands({ applyCommand, validationCommands: validation_commands });
+      const orchestratorNextSteps = buildOrchestratorNextSteps({
+        resultClass: result.result_class,
+        projectMode,
+        applyCommand,
+        validationCommands: validation_commands,
+      });
       const report = {
         worker_id: workerId,
-        status: finalStatus,
+        status: result.status,
+        run_status: runStatus,
+        result_class: result.result_class,
+        status_reason: result.status_reason,
+        validation_scope: validationScopeText(validation, result.result_class === 'patch_ready_limited_validation'),
+        data_validation: result.data_validation,
+        data_validation_reason: result.data_validation_reason,
+        orchestrator_next_steps: orchestratorNextSteps,
+        recommended_main_repo_commands: recommendedCommands,
+        project_mode: projectMode,
         execution_mode: executionMode,
         task: taskDir || null,
         model,
@@ -1003,7 +1201,7 @@ async function dispatch(args) {
         log_file: logPath,
         report_file: reportPath,
         patch_file: executionMode === 'worktree' ? patchPath : null,
-        apply_command: executionMode === 'worktree' ? `git apply "${patchPath}"` : null,
+        apply_command: applyCommand,
         worker_repo: executionMode === 'worktree' ? worker.repoDir : null,
         diff: diffInfo,
         finished_at: new Date().toISOString(),
@@ -1014,6 +1212,9 @@ async function dispatch(args) {
         mode, task: taskDir,
         worker_id: workerId, execution_mode: executionMode,
         status: report.status,
+        result_class: report.result_class,
+        status_reason: report.status_reason,
+        validation_scope: report.validation_scope,
         exit_code: exitCode, signal: signal || null, killed: killed || signaled,
         validation: report.validation,
         validation_failures: validation.failures || [],
@@ -1039,17 +1240,21 @@ async function dispatch(args) {
         }
         validationBlock += '\n';
       }
-      let artifactBlock = `\n--- artifacts ---\nstatus: ${report.status}\nreport: ${reportPath}\n`;
+      let artifactBlock = `\n--- artifacts ---\nstatus: ${report.status}\nresult_class: ${report.result_class}\nreason: ${report.status_reason}\nvalidation_scope: ${report.validation_scope}\nreport: ${reportPath}\n`;
       if (executionMode === 'worktree') {
         artifactBlock += `worker_repo: ${worker.repoDir}\npatch: ${patchPath}\napply: ${report.apply_command}\n`;
         if (diffInfo && !diffInfo.ok) artifactBlock += `diff_error: ${diffInfo.error}\n`;
       }
+      if (orchestratorNextSteps.length > 0) {
+        artifactBlock += `next_steps:\n`;
+        for (const step of orchestratorNextSteps) artifactBlock += `  - ${step}\n`;
+      }
 
-      const isError = !ok;
+      const isError = !['done', 'patch_ready_limited_validation'].includes(report.status);
       finish({
         content: [{
           type: 'text',
-          text: `${metaResponse}\nPi exited with code ${exitCode}${signal ? ` (signal ${signal})` : ''}.\n${artifactBlock}${validationBlock}\n--- output (head + tail) ---\n\n${output}`,
+          text: `${metaResponse}\nPi exited with code ${exitCode}${signal ? ` (signal ${signal})` : ''}.\n${artifactBlock}${validationBlock}\nOutput captured in: ${logPath}\nUse read_report for the structured summary and optional log tail.`,
         }],
         isError,
       });
@@ -1062,6 +1267,14 @@ async function dispatch(args) {
       writeJsonFile(reportPath, {
         worker_id: workerId,
         status: 'spawn_error',
+        result_class: 'failed',
+        status_reason: 'Could not spawn Pi subprocess.',
+        validation_scope: 'not run',
+        data_validation: 'not_attempted',
+        data_validation_reason: 'Dispatch did not start.',
+        orchestrator_next_steps: ['Inspect error', 'Fix Pi binary/config', 'Re-dispatch'],
+        recommended_main_repo_commands: ['git status --short'],
+        project_mode: projectMode,
         execution_mode: executionMode,
         task: taskDir || null,
         error: err.message,
@@ -1156,17 +1369,97 @@ function smoke(args) {
   });
 }
 
+function candidateWorkerDirs(args) {
+  const { runtime_dir, worker_id, working_directory } = args;
+  const dirs = [];
+  if (runtime_dir) {
+    const resolvedRuntime = resolvePath(runtime_dir, working_directory);
+    if (worker_id) {
+      dirs.push(path.join(resolvedRuntime, 'pi-workers', worker_id));
+      dirs.push(path.join(resolvedRuntime, worker_id));
+    }
+    dirs.push(resolvedRuntime);
+  }
+  if (worker_id) {
+    const base = working_directory ? resolveRuntimeDir(resolvePath(working_directory)) : TMP_RUNTIME_DIR;
+    dirs.push(path.join(base, 'pi-workers', worker_id));
+  }
+  return [...new Set(dirs)];
+}
+
+function resolveReportInputs(args) {
+  const { log_file, report_file, working_directory } = args;
+  if (report_file) {
+    const reportPath = resolvePath(report_file, working_directory);
+    return { reportPath, logPath: null };
+  }
+  if (log_file) {
+    const logPath = resolvePath(log_file, working_directory);
+    return { reportPath: path.join(path.dirname(logPath), 'report.json'), logPath };
+  }
+  for (const dir of candidateWorkerDirs(args)) {
+    const reportPath = path.join(dir, 'report.json');
+    if (fs.existsSync(reportPath)) return { reportPath, logPath: path.join(dir, 'output.log') };
+  }
+  return { reportPath: null, logPath: null };
+}
+
+function summarizeReport(report, reportPath) {
+  const changed = Array.isArray(report.changed_files) ? report.changed_files : [];
+  const steps = Array.isArray(report.orchestrator_next_steps) ? report.orchestrator_next_steps : [];
+  const commands = Array.isArray(report.recommended_main_repo_commands) ? report.recommended_main_repo_commands : [];
+  let text = `--- report summary ---\n`;
+  text += `report: ${reportPath}\n`;
+  text += `status: ${report.status || '(unknown)'}\n`;
+  text += `result_class: ${report.result_class || '(missing)'}\n`;
+  text += `project_mode: ${report.project_mode || '(unknown)'}\n`;
+  if (report.status_reason) text += `status_reason: ${report.status_reason}\n`;
+  if (report.validation_scope) text += `validation_scope: ${report.validation_scope}\n`;
+  if (report.data_validation) text += `data_validation: ${report.data_validation}\n`;
+  if (report.data_validation_reason) text += `data_validation_reason: ${report.data_validation_reason}\n`;
+  if (report.apply_command) text += `apply_command: ${report.apply_command}\n`;
+  if (changed.length > 0) {
+    text += `changed_files (${changed.length}):\n`;
+    for (const f of changed.slice(0, 30)) text += `  ${f}\n`;
+    if (changed.length > 30) text += `  ... +${changed.length - 30} more\n`;
+  } else {
+    text += `changed_files: none\n`;
+  }
+  if (steps.length > 0) {
+    text += `orchestrator_next_steps:\n`;
+    for (const step of steps) text += `  - ${step}\n`;
+  }
+  if (commands.length > 0) {
+    text += `recommended_main_repo_commands:\n`;
+    for (const cmd of commands) text += `  ${cmd}\n`;
+  }
+  return text;
+}
+
 function readReport(args) {
-  const { log_file, working_directory, lines = 200 } = args;
-  if (!log_file) return { content: [{ type: 'text', text: 'Error: log_file is required.' }], isError: true };
-  const resolved = resolvePath(log_file, working_directory);
-  if (!fs.existsSync(resolved)) return { content: [{ type: 'text', text: `Log not found: ${resolved}` }], isError: true };
+  const { lines = 200 } = args;
+  const { reportPath, logPath } = resolveReportInputs(args);
+  if (!reportPath && !logPath) {
+    return { content: [{ type: 'text', text: 'Error: provide log_file, report_file, or runtime_dir plus worker_id.' }], isError: true };
+  }
   try {
     const n = Number.isFinite(Number(lines)) ? Math.max(1, Math.min(10000, Math.floor(Number(lines)))) : 200;
-    const raw = fs.readFileSync(resolved, 'utf-8');
-    const parts = raw.split('\n');
-    const content = parts.slice(Math.max(0, parts.length - n - 1)).join('\n');
-    return { content: [{ type: 'text', text: `--- ${resolved} (last ${n} lines) ---\n\n${content}` }] };
+    let text = '';
+    if (reportPath && fs.existsSync(reportPath)) {
+      const report = JSON.parse(fs.readFileSync(reportPath, 'utf-8'));
+      text += summarizeReport(report, reportPath);
+    } else if (reportPath) {
+      text += `report not found: ${reportPath}\n`;
+    }
+    const resolvedLog = logPath || (reportPath ? path.join(path.dirname(reportPath), 'output.log') : null);
+    if (resolvedLog && fs.existsSync(resolvedLog)) {
+      const raw = fs.readFileSync(resolvedLog, 'utf-8');
+      const parts = raw.split('\n');
+      const content = parts.slice(Math.max(0, parts.length - n - 1)).join('\n');
+      text += `\n--- ${resolvedLog} (last ${n} lines) ---\n\n${content}`;
+    }
+    if (!text.trim()) return { content: [{ type: 'text', text: `No report/log found for provided arguments.` }], isError: true };
+    return { content: [{ type: 'text', text }] };
   } catch (e) {
     return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true };
   }
@@ -1180,6 +1473,7 @@ function previewPrompt(args) {
     execution_mode: executionModeInput,
     extra_instructions,
     scope,
+    context_files,
     trellis_context_id,
     validation_commands = [],
   } = args;
@@ -1191,9 +1485,9 @@ function previewPrompt(args) {
   let body;
   if (taskDir) {
     const context = assembleTrellisContext(workDir, taskDir, mode);
-    body = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands });
+    body = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands, context_files: readContextFiles(workDir, context_files) });
   } else {
-    body = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode);
+    body = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode, readContextFiles(workDir, context_files));
   }
   return { content: [{ type: 'text', text: body }] };
 }
@@ -1219,6 +1513,7 @@ const TOOLS = [
         dry_run: { type: 'boolean', default: false, description: 'Build prompt without launching Pi.' },
         extra_instructions: { type: 'string' },
         scope: { type: 'string', description: 'File/path constraints stated to Pi.' },
+        context_files: { type: 'array', items: { type: 'string' }, description: 'Optional additional files to embed into the prompt. Contents are included only when explicitly requested.' },
         trellis_context_id: { type: 'string', description: 'Optional Trellis session/context id. Passed as TRELLIS_CONTEXT_ID when auto-resolving the active task via task.py current.' },
         validation_commands: { type: 'array', items: { type: 'string' }, description: 'Commands Pi runs before reporting done.' },
         channel: { type: 'string', description: 'Trellis channel name. Overrides TRELLIS_CHANNEL / TRELLIS_CHANNEL_NAME env. When set, message events are emitted into the channel for audit.' },
@@ -1241,6 +1536,7 @@ const TOOLS = [
         execution_mode: { type: 'string', enum: ['review', 'patch', 'worktree', 'direct'] },
         extra_instructions: { type: 'string' },
         scope: { type: 'string' },
+        context_files: { type: 'array', items: { type: 'string' } },
         trellis_context_id: { type: 'string' },
         validation_commands: { type: 'array', items: { type: 'string' } },
       },
@@ -1259,15 +1555,17 @@ const TOOLS = [
   },
   {
     name: 'read_report',
-    description: 'Read Pi\'s completion report from an output log file.',
+    description: 'Read Pi\'s completion report from report.json/log files or a Trellis/standalone runtime directory.',
     inputSchema: {
       type: 'object',
       properties: {
-        log_file: { type: 'string', description: 'Path to Pi output log' },
+        log_file: { type: 'string', description: 'Path to Pi output log. report.json is read from the same directory when present.' },
+        report_file: { type: 'string', description: 'Path to report.json.' },
+        runtime_dir: { type: 'string', description: 'Runtime dir or worker dir. Supports .trellis/.runtime and standalone /tmp/pi-adapter layouts.' },
+        worker_id: { type: 'string', description: 'Worker id under <runtime_dir>/pi-workers/<worker-id>.' },
         lines: { type: 'number', default: 200 },
         working_directory: { type: 'string' },
       },
-      required: ['log_file'],
     },
   },
 ];
