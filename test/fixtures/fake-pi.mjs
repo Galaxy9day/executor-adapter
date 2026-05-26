@@ -31,6 +31,14 @@ if (scenario === 'diff') {
   console.log('fake pi starting');
   console.error('Error: Model "fake/model" not found. Use --list-models to see available models.');
   process.exit(1);
+} else if (scenario === 'smoke-ready') {
+  console.log('PI READY');
+} else if (scenario === 'sse-error') {
+  console.error('stream_read_error');
+  process.exit(1);
+} else if (scenario === 'api-key-error') {
+  console.error('No API key found for azure-openai-responses');
+  process.exit(1);
 } else {
   console.error(`Unknown FAKE_PI_SCENARIO: ${scenario}`);
   process.exit(2);

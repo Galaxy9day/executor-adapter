@@ -42,7 +42,7 @@ import * as crypto from 'node:crypto';
 // ---- Constants ----
 
 const SERVER_NAME = 'pi-adapter';
-const SERVER_VERSION = '0.8.1';  // keep in sync with package.json
+const SERVER_VERSION = '0.8.2';  // keep in sync with package.json
 const TMP_RUNTIME_DIR = path.join(os.tmpdir(), SERVER_NAME);
 const CHANNEL_ENV_ALIASES = ['TRELLIS_CHANNEL', 'TRELLIS_CHANNEL_NAME'];
 const TRELLIS_BIN_ENV = 'TRELLIS_BINARY';
@@ -50,6 +50,7 @@ const PI_BIN_ENV = 'PI_BINARY';
 const DEFAULT_WRITE_TOOLS = 'read,bash,edit,write,grep,find,ls';
 const DEFAULT_READ_TOOLS = 'read,grep,find,ls';
 const DEFAULT_PATCH_TOOLS = 'read,bash,grep,find,ls';
+const PROMPT_SIZE_WARN_BYTES = 80 * 1024;
 
 // ---- Small utilities ----
 
@@ -321,9 +322,20 @@ process.on('SIGTERM', () => shutdownWithChildren(143));
 
 let _modelMapCache = null;
 function loadModelMap() {
-  if (_modelMapCache !== null) return _modelMapCache;
   const cfgPath = path.join(os.homedir(), '.pi', 'config.toml');
-  const raw = readFile(cfgPath);
+  let mtimeMs = null;
+  try {
+    mtimeMs = fs.statSync(cfgPath).mtimeMs;
+  } catch {}
+  if (
+    _modelMapCache &&
+    _modelMapCache.cfgPath === cfgPath &&
+    _modelMapCache.mtimeMs === mtimeMs
+  ) {
+    return _modelMapCache.map;
+  }
+
+  const raw = mtimeMs === null ? null : readFile(cfgPath);
   let map = {};
   if (raw) {
     try {
@@ -349,7 +361,8 @@ function loadModelMap() {
       logErr(`TOML parse error in ${cfgPath}: ${e.message}`);
     }
   }
-  _modelMapCache = map;
+  logErr(`reloaded model map from ${cfgPath} mtime=${mtimeMs === null ? 'missing' : mtimeMs}`);
+  _modelMapCache = { cfgPath, mtimeMs, map };
   return map;
 }
 
@@ -472,6 +485,7 @@ function buildDispatchPrompt(args) {
   const extraInstructions = args.extra_instructions || '';
   const scopeConstraint = args.scope || '';
   const validationCommands = args.validation_commands || [];
+  const embedContext = args.embed_context !== false;
   const modeLabel = mode === 'check' ? 'Quality Check' : mode === 'implement' ? 'Implementation' : 'Custom';
 
   let p = `# Pi Dispatch: ${modeLabel}\n\nActive task: \`${taskDir}\`\n\n`;
@@ -496,9 +510,16 @@ function buildDispatchPrompt(args) {
 
   if (manifest.files.length > 0 || Object.keys(artifacts).length > 0) {
     p += `\n## Embedded Trellis Context\n\n`;
-    p += `These are embedded so isolated Pi workers can run from a clean worktree without depending on uncommitted task files.\n\n`;
-    for (const f of manifest.files) p += fencedContent(f.path, f.content);
-    for (const [name, content] of Object.entries(artifacts)) p += fencedContent(`${taskDir}/${name}`, content);
+    if (embedContext) {
+      p += `These are embedded so isolated Pi workers can run from a clean worktree without depending on uncommitted task files.\n\n`;
+      for (const f of manifest.files) p += fencedContent(f.path, f.content);
+      for (const [name, content] of Object.entries(artifacts)) p += fencedContent(`${taskDir}/${name}`, content);
+    } else {
+      p += `Context embedding is disabled. Read these paths on demand from the worktree before editing:\n\n`;
+      for (const f of manifest.files) p += `- \`${f.path}\`\n`;
+      for (const name of Object.keys(artifacts)) p += `- \`${taskDir}/${name}\`\n`;
+      p += '\n';
+    }
   }
 
   p = appendContextFilesPrompt(p, args.context_files);
@@ -616,6 +637,12 @@ function makeHeadTailBuffer(headCap = 10 * 1024, tailCap = 40 * 1024) {
   let head = '';
   let tail = '';
   let droppedMiddle = false;
+  const render = () => {
+    if (!tail) return head;
+    return droppedMiddle
+      ? `${head}\n\n...[middle of output truncated]...\n\n${tail}`
+      : head + tail;
+  };
   return {
     push(s) {
       if (head.length < headCap) {
@@ -630,13 +657,54 @@ function makeHeadTailBuffer(headCap = 10 * 1024, tailCap = 40 * 1024) {
         droppedMiddle = true;
       }
     },
-    finalize() {
-      if (!tail) return head;
-      return droppedMiddle
-        ? `${head}\n\n...[middle of output truncated]...\n\n${tail}`
-        : head + tail;
-    },
+    snapshot: render,
+    finalize: render,
   };
+}
+
+function snapshotBuffer(buf) {
+  if (!buf) return '';
+  if (typeof buf.snapshot === 'function') return buf.snapshot();
+  if (typeof buf.finalize === 'function') return buf.finalize();
+  return '';
+}
+
+function promptSizeWarning(promptBytes) {
+  if (promptBytes <= PROMPT_SIZE_WARN_BYTES) return '';
+  const kb = Math.ceil(promptBytes / 1024);
+  return `WARN: Prompt is ${kb} KB; large prompts can destabilize the Pi SSE client in isolated mode. Consider trimming implement.jsonl or using \`embed_context=false\`.`;
+}
+
+function logFileSize(logPath) {
+  try {
+    return fs.statSync(logPath).size;
+  } catch {
+    return 0;
+  }
+}
+
+function classifyPiFailureHint(stderr, stdout) {
+  const combined = `${stderr || ''}\n${stdout || ''}`;
+  const noKey = combined.match(/No API key found for\s+([^\s"'`.,;]+)/i);
+  if (noKey) {
+    const provider = noKey[1];
+    return `Pi resolved to built-in provider '${provider}'. If you intended a custom provider, pass \`model="gpt/gpt-5.5"\` (fully qualified) or restart the MCP after editing ~/.pi/config.toml.`;
+  }
+  if (/stream_read_error|Stream ended/i.test(combined)) {
+    return 'Upstream SSE stream failed. Common causes: very large prompt, network reset, provider rate limit. Try reducing implement.jsonl manifest size or switching to openai-completions-compatible provider.';
+  }
+  return '';
+}
+
+function formatTinyLogDiagnostics({ exitCode, logPath, logBytes, stdout, stderr }) {
+  const size = typeof logBytes === 'number' ? logBytes : logFileSize(logPath);
+  if (exitCode === 0 || size >= 512) return '';
+
+  let text = '\n--- pi failure hint ---\n';
+  text += `${classifyPiFailureHint(stderr, stdout) || 'Pi exited non-zero and output.log is tiny; in-memory stdout/stderr may contain the useful error.'}\n`;
+  text += `\n--- pi stdout (in-memory, head+tail) ---\n${String(stdout || '').trim() || '(empty)'}\n`;
+  text += `\n--- pi stderr (in-memory, head+tail) ---\n${String(stderr || '').trim() || '(empty)'}\n`;
+  return text;
 }
 
 function defaultExecutionMode(mode) {
@@ -996,6 +1064,7 @@ async function dispatch(args) {
     extra_instructions,
     scope,
     context_files,
+    embed_context = true,
     trellis_context_id,
     validation_commands = [],
     min_files_changed,
@@ -1042,7 +1111,7 @@ async function dispatch(args) {
   let promptBody = '';
   if (taskDir) {
     context = assembleTrellisContext(workDir, taskDir, mode);
-    promptBody = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands, context_files: readContextFiles(workDir, context_files) });
+    promptBody = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands, context_files: readContextFiles(workDir, context_files), embed_context });
   } else if (mode === 'custom') {
     if (!extra_instructions) return { content: [{ type: 'text', text: 'Error: custom mode requires extra_instructions.' }], isError: true };
     promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode, readContextFiles(workDir, context_files));
@@ -1066,6 +1135,9 @@ async function dispatch(args) {
   const reportPath = path.join(worker.workerDir, 'report.json');
   const patchPath = path.join(worker.workerDir, 'diff.patch');
   fs.writeFileSync(promptPath, promptBody, 'utf-8');
+  const promptBytes = fs.statSync(promptPath).size;
+  const promptWarning = promptSizeWarning(promptBytes);
+  if (promptWarning) logErr(promptWarning);
 
   let metaResponse = `Resolved task: ${taskDir || '(custom mode)'}\n`;
   if (context) {
@@ -1079,6 +1151,8 @@ async function dispatch(args) {
   metaResponse += `Prompt: ${promptPath}\n`;
   metaResponse += `Log: ${logPath}\n`;
   metaResponse += `Report: ${reportPath}\n`;
+  metaResponse += `Prompt size: ${Math.ceil(promptBytes / 1024)} KB\n`;
+  if (promptWarning) metaResponse += `${promptWarning}\n`;
   metaResponse += `Worker: ${workerId} (${executionMode})\n`;
   metaResponse += `Project mode: ${projectMode}\n`;
   if (executionMode === 'worktree') {
@@ -1178,6 +1252,7 @@ async function dispatch(args) {
 
     const timeout = timeout_minutes * 60 * 1000;
     let killed = false;
+    let logBytes = 0;
     const stdoutBuf = makeHeadTailBuffer();
     const stderrBuf = makeHeadTailBuffer(2 * 1024, 8 * 1024);
 
@@ -1194,8 +1269,14 @@ async function dispatch(args) {
       stdio: ['ignore', 'pipe', 'pipe'],
     }));
 
-    proc.stdout.on('data', (d) => stdoutBuf.push(d.toString()));
-    proc.stderr.on('data', (d) => stderrBuf.push(d.toString()));
+    proc.stdout.on('data', (d) => {
+      logBytes += d.length;
+      stdoutBuf.push(d.toString());
+    });
+    proc.stderr.on('data', (d) => {
+      logBytes += d.length;
+      stderrBuf.push(d.toString());
+    });
 
     const logStream = fs.createWriteStream(logPath, { flags: 'w' });
     proc.stdout.pipe(logStream);
@@ -1344,12 +1425,19 @@ async function dispatch(args) {
         artifactBlock += `next_steps:\n`;
         for (const step of orchestratorNextSteps) artifactBlock += `  - ${step}\n`;
       }
+      const tinyLogDiagnostics = formatTinyLogDiagnostics({
+        exitCode,
+        logPath,
+        logBytes,
+        stdout: snapshotBuffer(stdoutBuf) || stdout,
+        stderr: snapshotBuffer(stderrBuf) || stderr,
+      });
 
       const isError = !['done', 'patch_ready_limited_validation'].includes(report.status);
       finish({
         content: [{
           type: 'text',
-          text: `${metaResponse}\nPi exited with code ${exitCode}${signal ? ` (signal ${signal})` : ''}.\n${artifactBlock}${validationBlock}\nOutput captured in: ${logPath}\nUse read_report for the structured summary and optional log tail.`,
+          text: `${metaResponse}\nPi exited with code ${exitCode}${signal ? ` (signal ${signal})` : ''}.\n${artifactBlock}${validationBlock}${tinyLogDiagnostics}\nOutput captured in: ${logPath}\nUse read_report for the structured summary and optional log tail.`,
         }],
         isError,
       });
@@ -1395,10 +1483,13 @@ async function dispatch(args) {
 }
 
 function smoke(args) {
-  const { model: modelInput, working_directory } = args;
+  const { model: modelInput, mode = 'implement', working_directory } = args;
+  if (!['implement', 'check'].includes(mode)) {
+    return { content: [{ type: 'text', text: `Error: unsupported smoke mode "${mode}". Use implement or check.` }], isError: true };
+  }
   let model, modelFrom, modelKey;
   try {
-    ({ resolved: model, from: modelFrom, key: modelKey } = resolveModel(modelInput, 'implement'));
+    ({ resolved: model, from: modelFrom, key: modelKey } = resolveModel(modelInput, mode));
   } catch (e) {
     return { content: [{ type: 'text', text: e.message }], isError: true };
   }
@@ -1645,6 +1736,7 @@ function previewPrompt(args) {
     extra_instructions,
     scope,
     context_files,
+    embed_context = true,
     trellis_context_id,
     validation_commands = [],
   } = args;
@@ -1658,7 +1750,7 @@ function previewPrompt(args) {
   let body;
   if (taskDir) {
     const context = assembleTrellisContext(workDir, taskDir, mode);
-    body = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands, context_files: readContextFiles(workDir, context_files) });
+    body = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands, context_files: readContextFiles(workDir, context_files), embed_context });
   } else {
     body = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode, readContextFiles(workDir, context_files));
   }
@@ -1681,6 +1773,7 @@ const TOOLS = [
         thinking: { type: 'string', default: 'high' },
         execution_mode: { type: 'string', enum: ['review', 'patch', 'worktree', 'direct'], description: 'review=read-only report, patch=final-answer diff, worktree=isolated git worktree + exported diff.patch, direct=legacy in-place execution. Defaults to worktree for implement/custom and review for check.' },
         isolate_pi: { type: 'boolean', default: true, description: 'When true, disables Pi extensions/skills/context files/session persistence and uses a per-worker PI_CODING_AGENT_DIR.' },
+        embed_context: { type: 'boolean', default: true, description: 'When false, Trellis manifest/task artifact contents are not inlined under Embedded Trellis Context; only paths are listed for Pi to read on demand.' },
         tools: { type: 'string', description: 'Comma-separated Pi tools. Defaults by execution_mode: review=read,grep,find,ls; patch=read,bash,grep,find,ls; worktree/direct=read,bash,edit,write,grep,find,ls.' },
         timeout_minutes: { type: 'number', default: 60, description: 'Capped at 120.' },
         dry_run: { type: 'boolean', default: false, description: 'Build prompt without launching Pi.' },
@@ -1710,6 +1803,7 @@ const TOOLS = [
         extra_instructions: { type: 'string' },
         scope: { type: 'string' },
         context_files: { type: 'array', items: { type: 'string' } },
+        embed_context: { type: 'boolean', default: true },
         trellis_context_id: { type: 'string' },
         validation_commands: { type: 'array', items: { type: 'string' } },
       },
@@ -1722,6 +1816,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         model: { type: 'string', description: 'Logical name or fully qualified Pi route.' },
+        mode: { type: 'string', enum: ['implement', 'check'], default: 'implement', description: 'Default logical key to resolve when model is omitted.' },
         working_directory: { type: 'string' },
       },
     },

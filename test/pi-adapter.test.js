@@ -41,6 +41,21 @@ function makePiHome() {
   return home;
 }
 
+function writePiConfig(home, body) {
+  const dir = path.join(home, '.pi');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'config.toml'), body, 'utf-8');
+}
+
+function makeTrellisTask(repo, { taskDir = '.trellis/tasks/task-1', files = [] } = {}) {
+  const fullTaskDir = path.join(repo, taskDir);
+  fs.mkdirSync(fullTaskDir, { recursive: true });
+  fs.writeFileSync(path.join(fullTaskDir, 'prd.md'), '# PRD\n\nAcceptance criteria.\n', 'utf-8');
+  const jsonl = files.map(file => JSON.stringify({ file })).join('\n');
+  fs.writeFileSync(path.join(fullTaskDir, 'implement.jsonl'), `${jsonl}\n`, 'utf-8');
+  return taskDir;
+}
+
 function startMcp(extraEnv = {}) {
   const child = spawn(process.execPath, [SERVER], {
     cwd: ROOT,
@@ -238,6 +253,62 @@ test('smoke failure includes stdout, stderr, safe env, and seeded config paths',
   }
 });
 
+test('model map reloads after config.toml mtime changes', async () => {
+  const repo = makeRepo();
+  const home = makePiHome();
+  writePiConfig(home, '[pi_adapter]\nimplementer = "fake/old"\nreviewer = "fake/reviewer"\n');
+  const mcp = startMcp({ FAKE_PI_SCENARIO: 'smoke-ready', HOME: home });
+  try {
+    await mcp.init();
+    const first = await mcp.callTool('smoke', {
+      working_directory: repo,
+    });
+    assert.equal(first.isError, false);
+    assert.match(first.content[0].text, /model=fake\/old \(config:implementer\)/);
+
+    fs.writeFileSync(
+      path.join(home, '.pi', 'config.toml'),
+      '[pi_adapter]\nimplementer = "fake/new"\nreviewer = "fake/reviewer"\n',
+      'utf-8',
+    );
+    const future = new Date(Date.now() + 2000);
+    fs.utimesSync(path.join(home, '.pi', 'config.toml'), future, future);
+
+    const second = await mcp.callTool('smoke', {
+      working_directory: repo,
+    });
+    assert.equal(second.isError, false);
+    assert.match(second.content[0].text, /model=fake\/new \(config:implementer\)/);
+  } finally {
+    mcp.close();
+  }
+});
+
+test('smoke can resolve reviewer mode and direct model overrides', async () => {
+  const repo = makeRepo();
+  const home = makePiHome();
+  writePiConfig(home, '[pi_adapter]\nimplementer = "fake/implementer"\nreviewer = "fake/reviewer"\n');
+  const mcp = startMcp({ FAKE_PI_SCENARIO: 'smoke-ready', HOME: home });
+  try {
+    await mcp.init();
+    const reviewer = await mcp.callTool('smoke', {
+      mode: 'check',
+      working_directory: repo,
+    });
+    assert.equal(reviewer.isError, false);
+    assert.match(reviewer.content[0].text, /model=fake\/reviewer \(config:reviewer\)/);
+
+    const direct = await mcp.callTool('smoke', {
+      model: 'fake/direct',
+      working_directory: repo,
+    });
+    assert.equal(direct.isError, false);
+    assert.match(direct.content[0].text, /model=fake\/direct \(direct\)/);
+  } finally {
+    mcp.close();
+  }
+});
+
 test('patch-ready limited validation is not reported as blocked', async () => {
   const repo = makeRepo({ trellis: true });
   const mcp = startMcp({ FAKE_PI_SCENARIO: 'limited' });
@@ -278,6 +349,86 @@ test('exit zero with no diff is no_usable_patch', async () => {
     const report = readReport(result);
     assert.equal(report.status, 'no_patch');
     assert.equal(report.result_class, 'no_usable_patch');
+  } finally {
+    mcp.close();
+  }
+});
+
+test('non-zero dispatch with tiny output.log includes in-memory stderr diagnostics', async () => {
+  const repo = makeRepo();
+  const mcp = startMcp({ FAKE_PI_SCENARIO: 'sse-error' });
+  try {
+    await mcp.init();
+    const result = await mcp.callTool('dispatch', {
+      mode: 'custom',
+      model: 'fake/model',
+      execution_mode: 'worktree',
+      working_directory: repo,
+      extra_instructions: 'Trigger an SSE error.',
+    });
+    assert.equal(result.isError, true);
+    const text = result.content[0].text;
+    assert.match(text, /--- pi stderr \(in-memory, head\+tail\) ---/);
+    assert.match(text, /stream_read_error/);
+    assert.match(text, /Upstream SSE stream failed/);
+  } finally {
+    mcp.close();
+  }
+});
+
+test('non-zero dispatch classifies built-in provider API key errors', async () => {
+  const repo = makeRepo();
+  const mcp = startMcp({ FAKE_PI_SCENARIO: 'api-key-error' });
+  try {
+    await mcp.init();
+    const result = await mcp.callTool('dispatch', {
+      mode: 'custom',
+      model: 'fake/model',
+      execution_mode: 'worktree',
+      working_directory: repo,
+      extra_instructions: 'Trigger an auth error.',
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /Pi resolved to built-in provider 'azure-openai-responses'/);
+    assert.match(result.content[0].text, /model="gpt\/gpt-5\.5"/);
+  } finally {
+    mcp.close();
+  }
+});
+
+test('large prompts warn and embed_context=false lists Trellis paths without inlining file bodies', async () => {
+  const repo = makeRepo({ trellis: true });
+  const largeSpec = 'specs/large.md';
+  fs.mkdirSync(path.join(repo, 'specs'), { recursive: true });
+  fs.writeFileSync(path.join(repo, largeSpec), `# Large spec\n\n${'x'.repeat(90 * 1024)}\n`, 'utf-8');
+  const taskDir = makeTrellisTask(repo, { files: [largeSpec] });
+  runGit(repo, ['add', '.']);
+  runGit(repo, ['commit', '-m', 'add trellis task']);
+
+  const mcp = startMcp();
+  try {
+    await mcp.init();
+    const dryRun = await mcp.callTool('dispatch', {
+      mode: 'implement',
+      model: 'fake/model',
+      execution_mode: 'worktree',
+      working_directory: repo,
+      task_dir: taskDir,
+      dry_run: true,
+    });
+    assert.match(dryRun.content[0].text, /WARN: Prompt is \d+ KB; large prompts can destabilize/);
+
+    const listed = await mcp.callTool('preview_prompt', {
+      mode: 'implement',
+      execution_mode: 'worktree',
+      working_directory: repo,
+      task_dir: taskDir,
+      embed_context: false,
+    });
+    const text = listed.content[0].text;
+    assert.match(text, /Context embedding is disabled/);
+    assert.match(text, /- `specs\/large\.md`/);
+    assert.doesNotMatch(text, /xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/);
   } finally {
     mcp.close();
   }

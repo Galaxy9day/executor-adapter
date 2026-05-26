@@ -84,6 +84,7 @@ Assemble context, run Pi, optionally emit channel events, run post-validation, r
 | `thinking` | string | Pi thinking level. Default `high`. |
 | `execution_mode` | string | `review`, `patch`, `worktree`, or `direct`. Defaults to `worktree` for `implement/custom`, `review` for `check`. |
 | `isolate_pi` | boolean | Default `true`: disables Pi extensions/skills/prompt templates/context files/session persistence and uses a per-worker Pi home. |
+| `embed_context` | boolean | Default `true`: inline Trellis manifest/task artifact contents. When `false`, only list paths for Pi to read on demand. |
 | `tools` | string | Comma-separated tool list for Pi. Defaults by `execution_mode`: `review=read,grep,find,ls`, `patch=read,bash,grep,find,ls`, `worktree/direct=read,bash,edit,write,grep,find,ls`. |
 | `timeout_minutes` | number | Default 60, hard-capped at 120. |
 | `dry_run` | boolean | Build prompt without launching Pi. |
@@ -105,7 +106,7 @@ Assemble context, run Pi, optionally emit channel events, run post-validation, r
 - `patch`: asks Pi to produce a unified diff in its final answer without direct edits.
 - `direct`: legacy in-place execution in the target repository. Use only when the orchestrator explicitly wants Pi to write directly and the environment supports it.
 
-`worktree` prompts embed Trellis manifest files and task artifacts so Pi can run from a clean checkout even when task files are uncommitted in the main worktree.
+`worktree` prompts embed Trellis manifest files and task artifacts so Pi can run from a clean checkout even when task files are uncommitted in the main worktree. If the assembled prompt exceeds 80 KB, dispatch prints a warning because very large prompts can destabilize Pi's isolated-mode SSE client. Use a curated `implement.jsonl` or `embed_context=false` when Pi can read the files directly from the worktree.
 
 #### Result classes and report fields
 
@@ -149,9 +150,9 @@ The dispatch response intentionally does not inline Pi's long stdout/stderr. It 
 
 Same args as `dispatch` (subset). Renders the prompt without launching Pi.
 
-### `smoke({ model? })`
+### `smoke({ model?, mode? })`
 
-One-shot connectivity test. Verifies Pi binary is on PATH and the resolved model answers a trivial round-trip. On failure it prints separate `pi stdout` and `pi stderr` blocks, the resolved model route, safe Pi env values, and the config files copied into the isolated Pi home.
+One-shot connectivity test. Verifies Pi binary is on PATH and the resolved model answers a trivial round-trip. `model` accepts either a logical name or a fully qualified route, and `mode` (`implement` or `check`) chooses the default logical key when `model` is omitted. On failure it prints separate `pi stdout` and `pi stderr` blocks, the resolved model route, safe Pi env values, and the config files copied into the isolated Pi home.
 
 ### `read_report({ log_file?, report_file?, runtime_dir?, worker_id?, lines? })`
 
