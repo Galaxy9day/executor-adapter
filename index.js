@@ -3,11 +3,13 @@
 /**
  * pi-adapter MCP server
  *
- * Pi executor adapter for Trellis Phase 2.1 and standalone use.
+ * Executor adapter (Pi CLI + Codex CLI backends) for Trellis Phase 2.1 and
+ * standalone use. Executor-specific behavior lives in executors.js; routing
+ * defaults to codex for implement/custom and pi for check.
  *
  * Postures:
- * - With Trellis: reads task artifacts, assembles Pi prompts. Never modifies
- *   workflow, hooks, task.py, or artifacts.
+ * - With Trellis: reads task artifacts, assembles executor prompts. Never
+ *   modifies workflow, hooks, task.py, or artifacts.
  * - With `trellis channel`: emits message events into the channel so the
  *   audit trail belongs to Trellis core (worker_guard and event log are
  *   Trellis's, not ours).
@@ -32,21 +34,20 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import TOML from '@iarna/toml';
 import { spawn, execSync, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
+import { EXECUTORS, resolveExecutor } from './executors.js';
 
 // ---- Constants ----
 
 const SERVER_NAME = 'pi-adapter';
-const SERVER_VERSION = '0.8.2';  // keep in sync with package.json
+const SERVER_VERSION = '0.9.0';  // keep in sync with package.json
 const TMP_RUNTIME_DIR = path.join(os.tmpdir(), SERVER_NAME);
 const CHANNEL_ENV_ALIASES = ['TRELLIS_CHANNEL', 'TRELLIS_CHANNEL_NAME'];
 const TRELLIS_BIN_ENV = 'TRELLIS_BINARY';
-const PI_BIN_ENV = 'PI_BINARY';
 const DEFAULT_WRITE_TOOLS = 'read,bash,edit,write,grep,find,ls';
 const DEFAULT_READ_TOOLS = 'read,grep,find,ls';
 const DEFAULT_PATCH_TOOLS = 'read,bash,grep,find,ls';
@@ -109,16 +110,6 @@ function isGitRepo(workDir) {
 }
 
 // ---- Binary discovery (cached) ----
-
-let _piBin = undefined;
-function findPiBinary() {
-  if (_piBin !== undefined) return _piBin;
-  const fromEnv = process.env[PI_BIN_ENV];
-  if (fromEnv && fs.existsSync(fromEnv)) { _piBin = fromEnv; return _piBin; }
-  try { _piBin = execSync('which pi', { encoding: 'utf-8' }).trim() || null; }
-  catch { _piBin = null; }
-  return _piBin;
-}
 
 let _trellisBin = undefined;
 function findTrellisBinary() {
@@ -215,21 +206,10 @@ async function emitChannelEvent(channelName, eventName, payload, workDir) {
 }
 
 // ---- Subprocess hardening ----
+// Env scrubbing lives in executors.js (per-executor keep-lists over a shared
+// sensitive-pattern scrub).
 
-function buildPiEnv(parentEnv) {
-  const SENSITIVE = /TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE.?KEY|API.?KEY|_KEY$|_AUTH$|_BEARER$|_COOKIE$|^ANTHROPIC_|^OPENAI_|^CLAUDE_|^CCG_|^AWS_(ACCESS|SECRET)|^GH_TOKEN$|^GITHUB_TOKEN$|^OP_|^DOCKER_PASS/i;
-  const PI_KEEP = /^(PI_|NEWAPI_)/;
-  const out = {};
-  const stripped = [];
-  for (const [k, v] of Object.entries(parentEnv)) {
-    if (PI_KEEP.test(k)) { out[k] = v; continue; }
-    if (SENSITIVE.test(k)) { stripped.push(k); continue; }
-    out[k] = v;
-  }
-  return { env: out, stripped };
-}
-
-// ---- Dispatch lock (always acquired; Trellis channel does not own Pi worker lifecycle) ----
+// ---- Dispatch lock (always acquired; Trellis channel does not own executor lifecycle) ----
 
 const _activeLocks = new Set();
 const _activeChildren = new Set();
@@ -318,73 +298,7 @@ process.on('exit', cleanupAllLocks);
 process.on('SIGINT',  () => shutdownWithChildren(130));
 process.on('SIGTERM', () => shutdownWithChildren(143));
 
-// ---- Model resolution (TOML, no hard-codes) ----
-
-let _modelMapCache = null;
-function loadModelMap() {
-  const cfgPath = path.join(os.homedir(), '.pi', 'config.toml');
-  let mtimeMs = null;
-  try {
-    mtimeMs = fs.statSync(cfgPath).mtimeMs;
-  } catch {}
-  if (
-    _modelMapCache &&
-    _modelMapCache.cfgPath === cfgPath &&
-    _modelMapCache.mtimeMs === mtimeMs
-  ) {
-    return _modelMapCache.map;
-  }
-
-  const raw = mtimeMs === null ? null : readFile(cfgPath);
-  let map = {};
-  if (raw) {
-    try {
-      const parsed = TOML.parse(raw);
-      // Preferred section name + legacy alias (skill was previously named
-      // trellis-pi-adapter). New keys win when both exist.
-      const sections = [parsed.pi_adapter, parsed.trellis_pi_adapter];
-      let legacyUsed = false;
-      for (const section of sections) {
-        if (!section || typeof section !== 'object' || Array.isArray(section)) continue;
-        for (const [k, v] of Object.entries(section)) {
-          if (typeof v !== 'string') continue;
-          if (!(k in map)) {
-            map[k] = v;
-            if (section === parsed.trellis_pi_adapter) legacyUsed = true;
-          }
-        }
-      }
-      if (legacyUsed) {
-        logErr('reading legacy [trellis_pi_adapter] TOML section — rename to [pi_adapter] when convenient.');
-      }
-    } catch (e) {
-      logErr(`TOML parse error in ${cfgPath}: ${e.message}`);
-    }
-  }
-  logErr(`reloaded model map from ${cfgPath} mtime=${mtimeMs === null ? 'missing' : mtimeMs}`);
-  _modelMapCache = { cfgPath, mtimeMs, map };
-  return map;
-}
-
-class ModelResolutionError extends Error {
-  constructor(logicalKey) {
-    super(`Cannot resolve model "${logicalKey}". Configure ~/.pi/config.toml:\n\n  [pi_adapter]\n  implementer = "<your-pi-routable-model>"   # required for mode=implement|custom\n  reviewer    = "<your-pi-routable-model>"   # required for mode=check / cross-model review\n\nOr pass a fully qualified route directly, e.g. model="anthropic/claude-opus-4-7".`);
-    this.code = 'MODEL_NOT_RESOLVED';
-    this.logicalKey = logicalKey;
-  }
-}
-
-function resolveModel(input, mode) {
-  const defaultKey = mode === 'check' ? 'reviewer' : 'implementer';
-  const logicalKey = input || defaultKey;
-  const map = loadModelMap();
-  if (map[logicalKey]) return { resolved: map[logicalKey], from: 'config', key: logicalKey };
-  // Fully qualified route (contains '/') — pass through.
-  if (logicalKey.includes('/')) return { resolved: logicalKey, from: 'direct', key: null };
-  // Unresolved: throw. No silent fallback — that would leak whichever
-  // model name was vendored into the source onto users of the package.
-  throw new ModelResolutionError(logicalKey);
-}
+// ---- Model resolution + executor routing live in executors.js ----
 
 // ---- Trellis context assembly ----
 
@@ -488,7 +402,7 @@ function buildDispatchPrompt(args) {
   const embedContext = args.embed_context !== false;
   const modeLabel = mode === 'check' ? 'Quality Check' : mode === 'implement' ? 'Implementation' : 'Custom';
 
-  let p = `# Pi Dispatch: ${modeLabel}\n\nActive task: \`${taskDir}\`\n\n`;
+  let p = `# Executor Dispatch: ${modeLabel}\n\nActive task: \`${taskDir}\`\n\n`;
 
   if (mode === 'implement') {
     p += `You are the implementation executor for this Trellis task. The orchestrator (Claude Code / Codex / main Agent) will review your output.\n\n**Guards**:\n- Do NOT spawn other agents.\n- Do NOT modify task scope or mark the Trellis task complete.\n- Do NOT git commit.\n\n`;
@@ -511,7 +425,7 @@ function buildDispatchPrompt(args) {
   if (manifest.files.length > 0 || Object.keys(artifacts).length > 0) {
     p += `\n## Embedded Trellis Context\n\n`;
     if (embedContext) {
-      p += `These are embedded so isolated Pi workers can run from a clean worktree without depending on uncommitted task files.\n\n`;
+      p += `These are embedded so isolated executor workers can run from a clean worktree without depending on uncommitted task files.\n\n`;
       for (const f of manifest.files) p += fencedContent(f.path, f.content);
       for (const [name, content] of Object.entries(artifacts)) p += fencedContent(`${taskDir}/${name}`, content);
     } else {
@@ -542,13 +456,13 @@ function buildDispatchPrompt(args) {
 
 function buildNoTrellisPrompt(mode, extraInstructions, scope, validationCommands, executionMode = defaultExecutionMode(mode), contextFiles = []) {
   const modeLabel = mode === 'check' ? 'Quality Check' : mode === 'custom' ? 'Custom' : 'Implementation';
-  let p = `# Pi Dispatch: ${modeLabel} (no Trellis)\n\n`;
+  let p = `# Executor Dispatch: ${modeLabel} (no Trellis)\n\n`;
   if (mode === 'implement') {
     p += `You are the implementation executor. The main Agent will review your output.\n\n**Guards**:\n- Do NOT git commit.\n- Do NOT spawn other agents.\n\n`;
   } else if (mode === 'check') {
     p += `You are the quality check executor. Review all code changes. Fix issues directly.\n\n**Guards**:\n- Do NOT git commit.\n- Do NOT spawn other agents.\n\n`;
   } else if (mode === 'custom') {
-    p += `You are a Pi worker. The orchestrator will review your output.\n\n**Guards**:\n- Do NOT git commit.\n- Do NOT spawn other agents.\n\n`;
+    p += `You are an executor worker. The orchestrator will review your output.\n\n**Guards**:\n- Do NOT git commit.\n- Do NOT spawn other agents.\n\n`;
   }
   p += `## Task\n\n${extraInstructions}\n\n`;
   p = appendContextFilesPrompt(p, contextFiles);
@@ -683,27 +597,14 @@ function logFileSize(logPath) {
   }
 }
 
-function classifyPiFailureHint(stderr, stdout) {
-  const combined = `${stderr || ''}\n${stdout || ''}`;
-  const noKey = combined.match(/No API key found for\s+([^\s"'`.,;]+)/i);
-  if (noKey) {
-    const provider = noKey[1];
-    return `Pi resolved to built-in provider '${provider}'. If you intended a custom provider, pass \`model="gpt/gpt-5.5"\` (fully qualified) or restart the MCP after editing ~/.pi/config.toml.`;
-  }
-  if (/stream_read_error|Stream ended/i.test(combined)) {
-    return 'Upstream SSE stream failed. Common causes: very large prompt, network reset, provider rate limit. Try reducing implement.jsonl manifest size or switching to openai-completions-compatible provider.';
-  }
-  return '';
-}
-
-function formatTinyLogDiagnostics({ exitCode, logPath, logBytes, stdout, stderr }) {
+function formatTinyLogDiagnostics({ exec, exitCode, logPath, logBytes, stdout, stderr }) {
   const size = typeof logBytes === 'number' ? logBytes : logFileSize(logPath);
   if (exitCode === 0 || size >= 512) return '';
 
-  let text = '\n--- pi failure hint ---\n';
-  text += `${classifyPiFailureHint(stderr, stdout) || 'Pi exited non-zero and output.log is tiny; in-memory stdout/stderr may contain the useful error.'}\n`;
-  text += `\n--- pi stdout (in-memory, head+tail) ---\n${String(stdout || '').trim() || '(empty)'}\n`;
-  text += `\n--- pi stderr (in-memory, head+tail) ---\n${String(stderr || '').trim() || '(empty)'}\n`;
+  let text = `\n--- ${exec.name} failure hint ---\n`;
+  text += `${exec.failureHint(stderr, stdout) || `${exec.label} exited non-zero and output.log is tiny; in-memory stdout/stderr may contain the useful error.`}\n`;
+  text += `\n--- ${exec.name} stdout (in-memory, head+tail) ---\n${String(stdout || '').trim() || '(empty)'}\n`;
+  text += `\n--- ${exec.name} stderr (in-memory, head+tail) ---\n${String(stderr || '').trim() || '(empty)'}\n`;
   return text;
 }
 
@@ -717,14 +618,14 @@ function defaultToolsForExecution(executionMode) {
   return DEFAULT_WRITE_TOOLS;
 }
 
-function makeWorkerId(mode, taskDir, scope, extraInstructions) {
+function makeWorkerId(executor, mode, taskDir, scope, extraInstructions) {
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const fp = crypto
     .createHash('sha256')
     .update(`${mode}|${taskDir || ''}|${scope || ''}|${extraInstructions || ''}|${process.pid}|${Date.now()}`)
     .digest('hex')
     .slice(0, 8);
-  return `pi-${mode}-${ts}-${fp}`;
+  return `${executor}-${mode}-${ts}-${fp}`;
 }
 
 function seedPiAgentConfig(targetPiHome) {
@@ -743,18 +644,28 @@ function seedPiAgentConfig(targetPiHome) {
   return { count: copied.length, files: copied };
 }
 
-function createWorkerRuntime(runtimeDir, workerId) {
+function createWorkerRuntime(runtimeDir, workerId, executor) {
   const workerDir = path.join(runtimeDir, 'pi-workers', workerId);
   const repoDir = path.join(workerDir, 'repo');
-  const piHome = path.join(workerDir, 'pi-home');
-  const sessionDir = path.join(workerDir, 'sessions');
-  fs.mkdirSync(piHome, { recursive: true });
-  fs.mkdirSync(sessionDir, { recursive: true });
-  const seed = seedPiAgentConfig(piHome);
-  if (seed.count === 0) {
-    console.error(`[${SERVER_NAME}] WARNING: no Pi agent config files found in ~/.pi/agent/; Pi subprocess may fail with "Model not found"`);
+  fs.mkdirSync(workerDir, { recursive: true });
+  const worker = { workerId, workerDir, repoDir, configFiles: 0, configFilePaths: [] };
+  if (executor === 'pi') {
+    const piHome = path.join(workerDir, 'pi-home');
+    const sessionDir = path.join(workerDir, 'sessions');
+    fs.mkdirSync(piHome, { recursive: true });
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const seed = seedPiAgentConfig(piHome);
+    if (seed.count === 0) {
+      console.error(`[${SERVER_NAME}] WARNING: no Pi agent config files found in ~/.pi/agent/; Pi subprocess may fail with "Model not found"`);
+    }
+    worker.piHome = piHome;
+    worker.sessionDir = sessionDir;
+    worker.configFiles = seed.count;
+    worker.configFilePaths = seed.files;
+  } else {
+    worker.lastMessagePath = path.join(workerDir, 'last-message.txt');
   }
-  return { workerId, workerDir, repoDir, piHome, sessionDir, configFiles: seed.count, configFilePaths: seed.files };
+  return worker;
 }
 
 function createWorktree(sourceDir, repoDir) {
@@ -809,16 +720,6 @@ function prepareWorkerDiff(repoDir, patchFile) {
   return { ok: true, changedFiles, shortstat, patchFile, bytes: Buffer.byteLength(patch) };
 }
 
-function classifyRunStatus(exitCode, killed, output) {
-  if (killed) return 'timeout';
-  const text = output || '';
-  const approvalBlocked =
-    /approval|approve|permission|confirm|non[- ]interactive|no ui|stdin|tty/i.test(text) &&
-    /blocked|required|waiting|denied|refused|unavailable|cannot|can't|failed/i.test(text);
-  if (approvalBlocked) return 'blocked';
-  return exitCode === 0 ? 'done' : 'failed';
-}
-
 function hasUsablePatch(executionMode, diffInfo, changedFiles) {
   if (executionMode !== 'worktree') return false;
   return Boolean(diffInfo && diffInfo.ok && Array.isArray(changedFiles) && changedFiles.length > 0);
@@ -855,7 +756,7 @@ function classifyResult({ executionMode, status, finalStatus, exitCode, validati
     return {
       status: 'patch_ready_limited_validation',
       result_class: 'patch_ready_limited_validation',
-      status_reason: 'Pi produced a non-empty patch and static/auto validation passed, but data validation was not available in the isolated worktree.',
+      status_reason: 'The executor produced a non-empty patch and static/auto validation passed, but data validation was not available in the isolated worktree.',
       data_validation: 'not_attempted',
       data_validation_reason: 'Derived/generated data was unavailable in the isolated worker; run data validation in the main repository after applying the patch.',
     };
@@ -865,7 +766,7 @@ function classifyResult({ executionMode, status, finalStatus, exitCode, validati
     return {
       status: 'no_patch',
       result_class: 'no_usable_patch',
-      status_reason: 'Pi exited without producing changes in diff.patch.',
+      status_reason: 'The executor exited without producing changes in diff.patch.',
       data_validation: 'not_attempted',
       data_validation_reason: 'No patch was produced, so main-repository data validation is not applicable yet.',
     };
@@ -885,7 +786,7 @@ function classifyResult({ executionMode, status, finalStatus, exitCode, validati
     return {
       status: 'done',
       result_class: 'patch_ready',
-      status_reason: 'Pi produced a non-empty patch and post-validation passed.',
+      status_reason: 'The executor produced a non-empty patch and post-validation passed.',
       data_validation: 'not_attempted',
       data_validation_reason: 'Worktree dispatch does not prove main-repository data validation; run it after applying the patch.',
     };
@@ -895,7 +796,7 @@ function classifyResult({ executionMode, status, finalStatus, exitCode, validati
     return {
       status: 'done',
       result_class: 'completed',
-      status_reason: 'Pi completed and post-validation passed.',
+      status_reason: 'The executor completed and post-validation passed.',
       data_validation: 'not_attempted',
       data_validation_reason: 'No adapter-level data validation result was captured.',
     };
@@ -905,8 +806,8 @@ function classifyResult({ executionMode, status, finalStatus, exitCode, validati
     status: finalStatus,
     result_class: finalStatus === 'blocked' ? 'blocked' : 'failed',
     status_reason: finalStatus === 'blocked'
-      ? 'Pi could not continue and did not produce an apply-ready patch.'
-      : 'Pi did not complete successfully.',
+      ? 'The executor could not continue and did not produce an apply-ready patch.'
+      : 'The executor did not complete successfully.',
     data_validation: 'not_attempted',
     data_validation_reason: 'Main-repository data validation should wait until dispatch succeeds.',
   };
@@ -979,6 +880,7 @@ function safeSmokeEnv(env) {
     'PI_OFFLINE',
     'PI_SKIP_VERSION_CHECK',
     'PI_BINARY',
+    'CODEX_BINARY',
   ];
   const out = {};
   for (const key of keys) {
@@ -1027,7 +929,7 @@ function dirSizeBytes(dir) {
 
 function runtimeWorkersDir(runtimeDir) {
   const base = path.basename(runtimeDir);
-  if (base.startsWith('pi-') && fs.existsSync(path.join(runtimeDir, 'report.json'))) return path.dirname(runtimeDir);
+  if (/^(pi|codex)-/.test(base) && fs.existsSync(path.join(runtimeDir, 'report.json'))) return path.dirname(runtimeDir);
   if (base === 'pi-workers') return runtimeDir;
   return path.join(runtimeDir, 'pi-workers');
 }
@@ -1054,11 +956,13 @@ async function dispatch(args) {
     mode = 'implement',
     task_dir: explicitTaskDir,
     working_directory: cwd,
+    executor: executorInput,
     model: modelInput,
     thinking = 'high',
     tools: toolsInput,
     execution_mode: executionModeInput,
-    isolate_pi = true,
+    isolate_executor,
+    isolate_pi,
     timeout_minutes: timeoutInput = 60,
     dry_run = false,
     extra_instructions,
@@ -1073,6 +977,7 @@ async function dispatch(args) {
     min_diff_lines,
   } = args;
 
+  const isolateExecutor = isolate_executor ?? isolate_pi ?? true;
   const timeout_minutes = Math.min(timeoutInput, 120);
   const workDir = cwd || process.cwd();
   const executionMode = executionModeInput || defaultExecutionMode(mode);
@@ -1083,11 +988,18 @@ async function dispatch(args) {
   if (executionMode === 'worktree' && !isGitRepo(workDir)) {
     return { content: [{ type: 'text', text: `Error: execution_mode=worktree requires a git repository: ${workDir}` }], isError: true };
   }
+  let executor;
+  try {
+    executor = resolveExecutor(executorInput, mode);
+  } catch (e) {
+    return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true };
+  }
+  const exec = EXECUTORS[executor];
   const channelName = detectChannel(args, process.env);
   const projectMode = detectProjectMode(workDir, channelName, executionMode);
   let model, modelFrom, modelKey;
   try {
-    ({ resolved: model, from: modelFrom, key: modelKey } = resolveModel(modelInput, mode));
+    ({ resolved: model, from: modelFrom, key: modelKey } = exec.resolveModel(modelInput, mode));
   } catch (e) {
     return { content: [{ type: 'text', text: e.message }], isError: true };
   }
@@ -1128,15 +1040,15 @@ async function dispatch(args) {
   const runtimeDir = resolveRuntimeDir(workDir);
   fs.mkdirSync(runtimeDir, { recursive: true });
 
-  const workerId = makeWorkerId(mode, taskDir, scope, extra_instructions);
-  const worker = createWorkerRuntime(runtimeDir, workerId);
+  const workerId = makeWorkerId(executor, mode, taskDir, scope, extra_instructions);
+  const worker = createWorkerRuntime(runtimeDir, workerId, executor);
   const promptPath = path.join(worker.workerDir, 'prompt.md');
   const logPath = path.join(worker.workerDir, 'output.log');
   const reportPath = path.join(worker.workerDir, 'report.json');
   const patchPath = path.join(worker.workerDir, 'diff.patch');
   fs.writeFileSync(promptPath, promptBody, 'utf-8');
   const promptBytes = fs.statSync(promptPath).size;
-  const promptWarning = promptSizeWarning(promptBytes);
+  const promptWarning = executor === 'pi' ? promptSizeWarning(promptBytes) : '';
   if (promptWarning) logErr(promptWarning);
 
   let metaResponse = `Resolved task: ${taskDir || '(custom mode)'}\n`;
@@ -1159,28 +1071,38 @@ async function dispatch(args) {
     metaResponse += `Worker repo: ${worker.repoDir}\n`;
     metaResponse += `Patch: ${patchPath}\n`;
   }
-  metaResponse += `Model: ${model} (${modelFrom}${modelKey ? `:${modelKey}` : ''}, thinking: ${thinking})\n`;
-  metaResponse += `Tools: ${tools}\n`;
+  metaResponse += `Executor: ${executor}\n`;
+  metaResponse += `Model: ${model || '(codex CLI default)'} (${modelFrom}${modelKey ? `:${modelKey}` : ''}, thinking: ${thinking})\n`;
+  if (executor === 'codex') {
+    metaResponse += `Sandbox: ${exec.sandboxFor(executionMode)} (codex; tools param not applicable)\n`;
+  } else {
+    metaResponse += `Tools: ${tools}\n`;
+  }
   metaResponse += `Timeout: ${timeout_minutes} min\n`;
   metaResponse += `Channel: ${channelName || '(none, local mode)'}\n`;
-  metaResponse += `Pi config: seeded ${worker.configFiles || 0} agent file(s) into isolated piHome\n`;
+  if (executor === 'pi') {
+    metaResponse += `Pi config: seeded ${worker.configFiles || 0} agent file(s) into isolated piHome\n`;
+  }
 
-  const { env: piEnv, stripped: strippedEnv } = buildPiEnv(process.env);
+  const { env: execEnv, stripped: strippedEnv } = exec.buildEnv(process.env);
   if (strippedEnv.length > 0) {
-    metaResponse += `Env: scrubbed ${strippedEnv.length} sensitive var${strippedEnv.length === 1 ? '' : 's'} from Pi subprocess\n`;
+    metaResponse += `Env: scrubbed ${strippedEnv.length} sensitive var${strippedEnv.length === 1 ? '' : 's'} from ${exec.label} subprocess\n`;
   }
 
   if (dry_run) {
     return {
       content: [{
         type: 'text',
-        text: `[DRY RUN] No Pi process started.\n\n${metaResponse}\n--- Generated prompt (first 4000 chars) ---\n\n${promptBody.slice(0, 4000)}${promptBody.length > 4000 ? '\n... (truncated)' : ''}`,
+        text: `[DRY RUN] No ${exec.label} process started.\n\n${metaResponse}\n--- Generated prompt (first 4000 chars) ---\n\n${promptBody.slice(0, 4000)}${promptBody.length > 4000 ? '\n... (truncated)' : ''}`,
       }],
     };
   }
 
-  const piBin = findPiBinary();
-  if (!piBin) return { content: [{ type: 'text', text: `Error: pi binary not found in PATH (or ${PI_BIN_ENV} env).\n\n${metaResponse}` }], isError: true };
+  const execBin = exec.findBinary();
+  if (!execBin) {
+    const other = executor === 'pi' ? 'codex' : 'pi';
+    return { content: [{ type: 'text', text: `Error: ${executor} binary not found in PATH (or ${exec.binaryEnvVar} env). Install it, fix ${exec.binaryEnvVar}, or pass executor="${other}".\n\n${metaResponse}` }], isError: true };
+  }
 
   let lockPath = null;
   lockPath = dispatchLockPath(runtimeDir, taskDir, scope, extra_instructions);
@@ -1214,6 +1136,7 @@ async function dispatch(args) {
         orchestrator_next_steps: ['Inspect error', 'Fix worktree setup', 'Re-dispatch'],
         recommended_main_repo_commands: ['git status --short'],
         project_mode: projectMode,
+        executor,
         error: e.message,
         execution_mode: executionMode,
         prompt_file: promptPath,
@@ -1227,7 +1150,7 @@ async function dispatch(args) {
   }
 
   await emitChannelEvent(channelName, 'dispatch_start', {
-    mode, task: taskDir, scope: scope || null, model,
+    mode, task: taskDir, scope: scope || null, model, executor,
     worker_id: workerId, execution_mode: executionMode,
     prompt_file: promptPath, log_file: logPath,
     report_file: reportPath, patch_file: executionMode === 'worktree' ? patchPath : null,
@@ -1235,20 +1158,11 @@ async function dispatch(args) {
   }, workDir);
 
   return new Promise((resolve) => {
-    const piArgs = [
-      '--model', model,
-      '--tools', tools,
-      '--thinking', thinking,
-      ...(isolate_pi ? [
-        '--no-extensions',
-        '--no-skills',
-        '--no-prompt-templates',
-        '--no-context-files',
-        '--no-session',
-      ] : []),
-      `@${promptPath}`,
-      '-p', 'Follow the instructions in the attached file. Read the listed files in order before writing any code.',
-    ];
+    const spawnSpec = exec.buildSpawnSpec({
+      model, tools, thinking,
+      isolate: isolateExecutor,
+      executionMode, promptPath, worker,
+    });
 
     const timeout = timeout_minutes * 60 * 1000;
     let killed = false;
@@ -1256,18 +1170,18 @@ async function dispatch(args) {
     const stdoutBuf = makeHeadTailBuffer();
     const stderrBuf = makeHeadTailBuffer(2 * 1024, 8 * 1024);
 
-    const proc = trackChild(spawn(piBin, piArgs, {
+    const proc = trackChild(spawn(execBin, spawnSpec.argv, {
       cwd: piWorkDir,
       env: {
-        ...piEnv,
-        PI_CODING_AGENT_DIR: worker.piHome,
-        PI_CODING_AGENT_SESSION_DIR: worker.sessionDir,
-        PI_OFFLINE: '1',
-        PI_SKIP_VERSION_CHECK: '1',
+        ...execEnv,
+        ...spawnSpec.env,
       },
-      // Pi's -p mode blocks on stdin EOF if stdin is a live pipe.
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [spawnSpec.stdinFd ?? 'ignore', 'pipe', 'pipe'],
     }));
+    if (spawnSpec.stdinFd != null) {
+      // spawn dups the fd; close our copy so codex sees EOF after the prompt.
+      try { fs.closeSync(spawnSpec.stdinFd); } catch {}
+    }
 
     proc.stdout.on('data', (d) => {
       logBytes += d.length;
@@ -1317,13 +1231,12 @@ async function dispatch(args) {
 
       const stdout = stdoutBuf.finalize();
       const stderr = stderrBuf.finalize();
-      let output = '';
-      if (stdout.trim()) output += stdout.trim();
-      if (stderr.trim()) output += (output ? '\n\n--- stderr ---\n' : '') + stderr.trim();
+      const interp = exec.interpretOutput({ exitCode, killed, stdout, stderr, worker });
+      let output = interp.output;
       if (killed) output += `\n\n[PROCESS KILLED: exceeded ${timeout_minutes} minute timeout]`;
       if (signaled && !killed) output += `\n\n[PROCESS EXITED BY SIGNAL: ${signal}]`;
 
-      const runStatus = signaled ? 'killed' : classifyRunStatus(exitCode, killed, output);
+      const runStatus = signaled ? 'killed' : interp.runStatus;
       const changedFiles = validation.changedFiles || diffInfo?.changedFiles || [];
       const ok = runStatus === 'done' && validation.passed && (!diffInfo || diffInfo.ok) && !(executionMode === 'worktree' && diffInfo?.ok && changedFiles.length === 0);
       const finalStatus = ok
@@ -1361,11 +1274,14 @@ async function dispatch(args) {
         project_mode: projectMode,
         execution_mode: executionMode,
         task: taskDir || null,
+        executor,
         model,
         model_source: modelFrom,
         model_key: modelKey,
         tools,
-        isolate_pi,
+        isolate_executor: isolateExecutor,
+        isolate_pi: isolateExecutor,
+        usage: interp.usage || null,
         exit_code: exitCode,
         signal: signal || null,
         killed: killed || signaled,
@@ -1385,7 +1301,7 @@ async function dispatch(args) {
       writeJsonFile(reportPath, report);
 
       await emitChannelEvent(channelName, ok ? 'dispatch_done' : 'dispatch_failed', {
-        mode, task: taskDir,
+        mode, task: taskDir, executor,
         worker_id: workerId, execution_mode: executionMode,
         status: report.status,
         result_class: report.result_class,
@@ -1426,6 +1342,7 @@ async function dispatch(args) {
         for (const step of orchestratorNextSteps) artifactBlock += `  - ${step}\n`;
       }
       const tinyLogDiagnostics = formatTinyLogDiagnostics({
+        exec,
         exitCode,
         logPath,
         logBytes,
@@ -1437,7 +1354,7 @@ async function dispatch(args) {
       finish({
         content: [{
           type: 'text',
-          text: `${metaResponse}\nPi exited with code ${exitCode}${signal ? ` (signal ${signal})` : ''}.\n${artifactBlock}${validationBlock}${tinyLogDiagnostics}\nOutput captured in: ${logPath}\nUse read_report for the structured summary and optional log tail.`,
+          text: `${metaResponse}\n${exec.label} exited with code ${exitCode}${signal ? ` (signal ${signal})` : ''}.\n${artifactBlock}${validationBlock}${tinyLogDiagnostics}\nOutput captured in: ${logPath}\nUse read_report for the structured summary and optional log tail.`,
         }],
         isError,
       });
@@ -1451,15 +1368,16 @@ async function dispatch(args) {
         worker_id: workerId,
         status: 'spawn_error',
         result_class: 'failed',
-        status_reason: 'Could not spawn Pi subprocess.',
+        status_reason: `Could not spawn ${exec.label} subprocess.`,
         validation_scope: 'not run',
         data_validation: 'not_attempted',
         data_validation_reason: 'Dispatch did not start.',
-        orchestrator_next_steps: ['Inspect error', 'Fix Pi binary/config', 'Re-dispatch'],
+        orchestrator_next_steps: ['Inspect error', `Fix ${exec.name} binary/config`, 'Re-dispatch'],
         recommended_main_repo_commands: ['git status --short'],
         project_mode: projectMode,
         execution_mode: executionMode,
         task: taskDir || null,
+        executor,
         error: err.message,
         prompt_file: promptPath,
         log_file: logPath,
@@ -1469,13 +1387,13 @@ async function dispatch(args) {
         finished_at: new Date().toISOString(),
       });
       await emitChannelEvent(channelName, 'spawn_error', {
-        mode, task: taskDir,
+        mode, task: taskDir, executor,
         worker_id: workerId, execution_mode: executionMode,
         error: err.message, report_file: reportPath,
         finished_at: new Date().toISOString(),
       }, workDir);
       finish({
-        content: [{ type: 'text', text: `${metaResponse}\nError spawning pi: ${err.message}` }],
+        content: [{ type: 'text', text: `${metaResponse}\nError spawning ${exec.name}: ${err.message}` }],
         isError: true,
       });
     });
@@ -1483,45 +1401,55 @@ async function dispatch(args) {
 }
 
 function smoke(args) {
-  const { model: modelInput, mode = 'implement', working_directory } = args;
+  const { model: modelInput, mode = 'implement', executor: executorInput, working_directory } = args;
   if (!['implement', 'check'].includes(mode)) {
     return { content: [{ type: 'text', text: `Error: unsupported smoke mode "${mode}". Use implement or check.` }], isError: true };
   }
+  let executor;
+  try {
+    executor = resolveExecutor(executorInput, mode);
+  } catch (e) {
+    return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true };
+  }
+  const exec = EXECUTORS[executor];
   let model, modelFrom, modelKey;
   try {
-    ({ resolved: model, from: modelFrom, key: modelKey } = resolveModel(modelInput, mode));
+    ({ resolved: model, from: modelFrom, key: modelKey } = exec.resolveModel(modelInput, mode));
   } catch (e) {
     return { content: [{ type: 'text', text: e.message }], isError: true };
   }
-  const piBin = findPiBinary();
-  if (!piBin) return { content: [{ type: 'text', text: 'Error: pi binary not found in PATH.' }], isError: true };
+  const execBin = exec.findBinary();
+  if (!execBin) return { content: [{ type: 'text', text: `Error: ${executor} binary not found in PATH (or ${exec.binaryEnvVar} env).` }], isError: true };
 
   // Use the same env scrub + isolation as dispatch so smoke catches config issues.
-  const { env: piEnv } = buildPiEnv(process.env);
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-smoke-'));
-  const isolatedHome = path.join(tmpDir, 'pi-home');
-  const sessionDir = path.join(tmpDir, 'sessions');
-  fs.mkdirSync(isolatedHome, { recursive: true });
-  fs.mkdirSync(sessionDir, { recursive: true });
-  const seed = seedPiAgentConfig(isolatedHome);
-  const childEnv = {
-    ...piEnv,
-    PI_CODING_AGENT_DIR: isolatedHome,
-    PI_CODING_AGENT_SESSION_DIR: sessionDir,
-    PI_OFFLINE: '1',
-    PI_SKIP_VERSION_CHECK: '1',
-  };
+  const { env: execEnv } = exec.buildEnv(process.env);
+  let tmpDir = null;
+  let seed = null;
+  let childEnv = execEnv;
+  if (executor === 'pi') {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-smoke-'));
+    const isolatedHome = path.join(tmpDir, 'pi-home');
+    const sessionDir = path.join(tmpDir, 'sessions');
+    fs.mkdirSync(isolatedHome, { recursive: true });
+    fs.mkdirSync(sessionDir, { recursive: true });
+    seed = seedPiAgentConfig(isolatedHome);
+    childEnv = {
+      ...execEnv,
+      PI_CODING_AGENT_DIR: isolatedHome,
+      PI_CODING_AGENT_SESSION_DIR: sessionDir,
+      PI_OFFLINE: '1',
+      PI_SKIP_VERSION_CHECK: '1',
+    };
+  }
   const safeEnv = safeSmokeEnv(childEnv);
+  const spec = exec.smokeSpec(model);
+  const modelLabel = `${model || '(codex CLI default)'} (${modelFrom}${modelKey ? `:${modelKey}` : ''})`;
 
   return new Promise((resolve) => {
-    const proc = trackChild(spawn(piBin, [
-      '--model', model,
-      '--tools', 'read',
-      '-p', 'Respond with exactly the string: PI READY. No other words.',
-    ], {
+    const proc = trackChild(spawn(execBin, spec.argv, {
       cwd: working_directory || process.cwd(),
       env: childEnv,
-      // Pi's -p mode blocks on stdin EOF if stdin is a live pipe.
+      // -p / exec modes block on stdin EOF if stdin is a live pipe.
       stdio: ['ignore', 'pipe', 'pipe'],
     }));
 
@@ -1535,7 +1463,7 @@ function smoke(args) {
       settled = true;
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      if (tmpDir) { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {} }
       resolve(result);
     };
     const timer = setTimeout(() => {
@@ -1546,21 +1474,27 @@ function smoke(args) {
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
     proc.on('close', (code, signal) => {
-      const ready = stdout.includes('PI READY');
-      let text = `Pi smoke: ${ready ? 'PASSED' : 'FAILED'} | model=${model} (${modelFrom}${modelKey ? `:${modelKey}` : ''}) | exit=${code} | signal=${signal || 'none'} | killed=${killed}`;
-      text += `\n${formatSeededConfig(seed)}`;
+      const interp = exec.interpretOutput({ exitCode: code, killed, stdout, stderr });
+      const ready = interp.output.includes(spec.readyText);
+      let text = `${exec.label} smoke: ${ready ? 'PASSED' : 'FAILED'} | model=${modelLabel} | exit=${code} | signal=${signal || 'none'} | killed=${killed}`;
+      if (executor === 'pi') text += `\n${formatSeededConfig(seed)}`;
       text += `\n${formatSmokeEnv(safeEnv)}`;
-      text += `\n${formatBlock('pi stdout', stdout)}`;
-      text += `\n${formatBlock('pi stderr', stderr)}`;
-      if (!ready) text += `\n${smokeDiagnostic(stdout, stderr, seed)}`;
+      text += `\n${formatBlock(`${exec.name} stdout`, stdout)}`;
+      text += `\n${formatBlock(`${exec.name} stderr`, stderr)}`;
+      if (!ready) {
+        const hint = executor === 'pi'
+          ? smokeDiagnostic(stdout, stderr, seed)
+          : (exec.failureHint(stderr, interp.output) || `diagnostic: inspect ${exec.name} stderr/stdout above and run the same command with the ${exec.name} CLI if needed.`);
+        text += `\n${hint}`;
+      }
       finish({
         content: [{ type: 'text', text }],
         isError: !ready,
       });
     });
     proc.on('error', (err) => {
-      let text = `Pi smoke: FAILED | model=${model} (${modelFrom}${modelKey ? `:${modelKey}` : ''}) | spawn_error=${err.message}`;
-      text += `\n${formatSeededConfig(seed)}`;
+      let text = `${exec.label} smoke: FAILED | model=${modelLabel} | spawn_error=${err.message}`;
+      if (executor === 'pi') text += `\n${formatSeededConfig(seed)}`;
       text += `\n${formatSmokeEnv(safeEnv)}`;
       finish({ content: [{ type: 'text', text }], isError: true });
     });
@@ -1688,7 +1622,7 @@ function cleanupRuntime(args) {
   const retained = [];
   let bytesFreed = 0;
   const entries = fs.readdirSync(workersDir, { withFileTypes: true })
-    .filter(entry => entry.isDirectory() && entry.name.startsWith('pi-'));
+    .filter(entry => entry.isDirectory() && /^(pi|codex)-/.test(entry.name));
 
   for (const entry of entries) {
     const dir = path.join(workersDir, entry.name);
@@ -1762,28 +1696,30 @@ function previewPrompt(args) {
 const TOOLS = [
   {
     name: 'dispatch',
-    description: 'Dispatch an implementation or check task to Pi. With an active Trellis task, reads implement.jsonl/check.jsonl + prd.md + design.md + implement.md to assemble Pi\'s prompt. Defaults to isolated worktree execution for implement/custom and read-only review for check. Emits Trellis channel events when TRELLIS_CHANNEL (or channel param) is set. Optional post-validation params catch "exit 0 + no work" failures.',
+    description: 'Dispatch an implementation or check task to an executor backend (Codex CLI for implement/custom by default, Pi for check/cross-model review). With an active Trellis task, reads implement.jsonl/check.jsonl + prd.md + design.md + implement.md to assemble the prompt. Defaults to isolated worktree execution for implement/custom and read-only review for check. Emits Trellis channel events when TRELLIS_CHANNEL (or channel param) is set. Optional post-validation params catch "exit 0 + no work" failures.',
     inputSchema: {
       type: 'object',
       properties: {
         mode: { type: 'string', enum: ['implement', 'check', 'custom'], default: 'implement' },
         task_dir: { type: 'string', description: 'Explicit Trellis task directory (relative to repo root). Omit to auto-resolve.' },
         working_directory: { type: 'string', description: 'Repo root. Defaults to cwd.' },
-        model: { type: 'string', description: 'Logical name (implementer / reviewer / custom key from ~/.pi/config.toml [pi_adapter]) or fully qualified Pi route. Omit to use the default for the mode.' },
+        executor: { type: 'string', enum: ['pi', 'codex'], description: 'Executor backend. Defaults: [pi_adapter] default_executor in ~/.pi/config.toml, else implement/custom→codex, check→pi.' },
+        model: { type: 'string', description: 'Logical name (implementer / reviewer / custom key from ~/.pi/config.toml [pi_adapter], or [pi_adapter.codex] for codex) or a fully qualified route/model name. Omit to use the default for the mode (codex falls back to the codex CLI default model).' },
         thinking: { type: 'string', default: 'high' },
         execution_mode: { type: 'string', enum: ['review', 'patch', 'worktree', 'direct'], description: 'review=read-only report, patch=final-answer diff, worktree=isolated git worktree + exported diff.patch, direct=legacy in-place execution. Defaults to worktree for implement/custom and review for check.' },
-        isolate_pi: { type: 'boolean', default: true, description: 'When true, disables Pi extensions/skills/context files/session persistence and uses a per-worker PI_CODING_AGENT_DIR.' },
-        embed_context: { type: 'boolean', default: true, description: 'When false, Trellis manifest/task artifact contents are not inlined under Embedded Trellis Context; only paths are listed for Pi to read on demand.' },
-        tools: { type: 'string', description: 'Comma-separated Pi tools. Defaults by execution_mode: review=read,grep,find,ls; patch=read,bash,grep,find,ls; worktree/direct=read,bash,edit,write,grep,find,ls.' },
+        isolate_executor: { type: 'boolean', default: true, description: 'Preferred isolation flag. When true, Pi gets --no-extensions/--no-skills/etc. plus a per-worker PI_CODING_AGENT_DIR; codex gets --ignore-user-config --ignore-rules --ephemeral.' },
+        isolate_pi: { type: 'boolean', default: true, description: 'Compatibility name for executor isolation. When true, Pi gets --no-extensions/--no-skills/etc. plus a per-worker PI_CODING_AGENT_DIR; codex gets --ignore-user-config --ignore-rules --ephemeral.' },
+        embed_context: { type: 'boolean', default: true, description: 'When false, Trellis manifest/task artifact contents are not inlined under Embedded Trellis Context; only paths are listed for the executor to read on demand.' },
+        tools: { type: 'string', description: 'Comma-separated Pi tools (pi executor only; codex uses --sandbox mapped from execution_mode). Defaults by execution_mode: review=read,grep,find,ls; patch=read,bash,grep,find,ls; worktree/direct=read,bash,edit,write,grep,find,ls.' },
         timeout_minutes: { type: 'number', default: 60, description: 'Capped at 120.' },
-        dry_run: { type: 'boolean', default: false, description: 'Build prompt without launching Pi.' },
+        dry_run: { type: 'boolean', default: false, description: 'Build prompt without launching the executor.' },
         extra_instructions: { type: 'string' },
-        scope: { type: 'string', description: 'File/path constraints stated to Pi.' },
+        scope: { type: 'string', description: 'File/path constraints stated to the executor.' },
         context_files: { type: 'array', items: { type: 'string' }, description: 'Optional additional files to embed into the prompt. Contents are included only when explicitly requested.' },
         trellis_context_id: { type: 'string', description: 'Optional Trellis session/context id. Passed as TRELLIS_CONTEXT_ID when auto-resolving the active task via task.py current.' },
-        validation_commands: { type: 'array', items: { type: 'string' }, description: 'Commands Pi runs before reporting done.' },
+        validation_commands: { type: 'array', items: { type: 'string' }, description: 'Commands the executor should run before reporting done.' },
         channel: { type: 'string', description: 'Trellis channel name. Overrides TRELLIS_CHANNEL / TRELLIS_CHANNEL_NAME env. When set, message events are emitted into the channel for audit.' },
-        min_files_changed: { type: 'number', description: 'Fail if fewer files are modified after Pi exits.' },
+        min_files_changed: { type: 'number', description: 'Fail if fewer files are modified after the executor exits.' },
         required_paths_modified: { type: 'array', items: { type: 'string' }, description: 'Fail if any path NOT in the diff.' },
         forbidden_paths: { type: 'array', items: { type: 'string' }, description: 'Fail if any path IS in the diff. Trailing / matches directory prefix.' },
         min_diff_lines: { type: 'number', description: 'Fail if total ins+del < N.' },
@@ -1792,7 +1728,7 @@ const TOOLS = [
   },
   {
     name: 'preview_prompt',
-    description: 'Preview the prompt that dispatch() would generate, without running Pi.',
+    description: 'Preview the prompt that dispatch() would generate, without running an executor.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1811,23 +1747,24 @@ const TOOLS = [
   },
   {
     name: 'smoke',
-    description: 'Quick smoke test: verify Pi binary and the resolved model are reachable.',
+    description: 'Quick smoke test: verify the executor binary (pi or codex) and the resolved model are reachable.',
     inputSchema: {
       type: 'object',
       properties: {
-        model: { type: 'string', description: 'Logical name or fully qualified Pi route.' },
+        model: { type: 'string', description: 'Logical name or fully qualified route/model name.' },
         mode: { type: 'string', enum: ['implement', 'check'], default: 'implement', description: 'Default logical key to resolve when model is omitted.' },
+        executor: { type: 'string', enum: ['pi', 'codex'], description: 'Executor backend. Defaults: [pi_adapter] default_executor, else implement→codex, check→pi.' },
         working_directory: { type: 'string' },
       },
     },
   },
   {
     name: 'read_report',
-    description: 'Read Pi\'s completion report from report.json/log files or a Trellis/standalone runtime directory.',
+    description: 'Read an executor completion report from report.json/log files or a Trellis/standalone runtime directory.',
     inputSchema: {
       type: 'object',
       properties: {
-        log_file: { type: 'string', description: 'Path to Pi output log. report.json is read from the same directory when present.' },
+        log_file: { type: 'string', description: 'Path to executor output log. report.json is read from the same directory when present.' },
         report_file: { type: 'string', description: 'Path to report.json.' },
         runtime_dir: { type: 'string', description: 'Runtime dir or worker dir. Supports .trellis/.runtime and standalone /tmp/pi-adapter layouts.' },
         worker_id: { type: 'string', description: 'Worker id under <runtime_dir>/pi-workers/<worker-id>.' },
@@ -1838,7 +1775,7 @@ const TOOLS = [
   },
   {
     name: 'cleanup_runtime',
-    description: 'Prune old Pi worker runtime directories under .trellis/.runtime/pi-workers or /tmp/pi-adapter/pi-workers.',
+    description: 'Prune old executor worker runtime directories under .trellis/.runtime/pi-workers or /tmp/pi-adapter/pi-workers.',
     inputSchema: {
       type: 'object',
       properties: {

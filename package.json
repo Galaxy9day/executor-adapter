@@ -1,7 +1,7 @@
 {
   "name": "@galaxy9day/pi-adapter",
-  "version": "0.8.2",
-  "description": "Pi (GPT-5.5) executor MCP for Trellis-aware and standalone use. Reads Trellis task artifacts, runs Pi in an isolated subprocess/worktree, and can optionally emit non-invasive Trellis channel audit messages.",
+  "version": "0.9.0",
+  "description": "Dual-executor MCP (Codex CLI for GPT implementation, Pi CLI for cross-model review) for Trellis-aware and standalone use. Reads Trellis task artifacts, runs the executor in an isolated subprocess/worktree, and can optionally emit non-invasive Trellis channel audit messages.",
   "type": "module",
   "main": "index.js",
   "bin": {
@@ -22,6 +22,8 @@
   },
   "files": [
     "index.js",
+    "executors.js",
+    "templates",
     "README.md",
     "LICENSE"
   ],
@@ -31,6 +33,8 @@
     "claude-code",
     "pi",
     "pi-coder",
+    "codex",
+    "codex-cli",
     "trellis",
     "channel-audit",
     "ai-agent",
