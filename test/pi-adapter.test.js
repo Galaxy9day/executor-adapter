@@ -19,7 +19,7 @@ function runGit(repo, args) {
 }
 
 function makeRepo({ trellis = false } = {}) {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-adapter-test-'));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'executor-adapter-test-'));
   runGit(repo, ['init']);
   runGit(repo, ['config', 'user.email', 'test@example.com']);
   runGit(repo, ['config', 'user.name', 'Test User']);
@@ -34,7 +34,7 @@ function makeRepo({ trellis = false } = {}) {
 }
 
 function makePiHome() {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-adapter-home-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'executor-adapter-home-'));
   const agent = path.join(home, '.pi', 'agent');
   fs.mkdirSync(agent, { recursive: true });
   fs.writeFileSync(path.join(agent, 'models.json'), '{"models":[]}\n', 'utf-8');
@@ -110,7 +110,7 @@ function startMcp(extraEnv = {}) {
       await request('initialize', {
         protocolVersion: '2024-11-05',
         capabilities: {},
-        clientInfo: { name: 'pi-adapter-test', version: '0.0.0' },
+        clientInfo: { name: 'executor-adapter-test', version: '0.0.0' },
       });
     },
     async callTool(name, args) {
@@ -203,7 +203,7 @@ test('standalone project without Trellis works in worktree mode', async () => {
     const report = readReport(result);
     assert.equal(report.project_mode, 'standalone_worktree');
     assert.equal(report.result_class, 'patch_ready');
-    assert.match(report.report_file, /pi-adapter\/pi-workers/);
+    assert.match(report.report_file, /executor-adapter\/pi-workers/);
   } finally {
     mcp.close();
   }
@@ -287,6 +287,24 @@ test('model map reloads after config.toml mtime changes', async () => {
     });
     assert.equal(second.isError, false);
     assert.match(second.content[0].text, /model=fake\/new \(config:implementer\)/);
+  } finally {
+    mcp.close();
+  }
+});
+
+test('executor_adapter config section takes priority over legacy pi_adapter', async () => {
+  const repo = makeRepo();
+  const home = makePiHome();
+  writePiConfig(home, '[pi_adapter]\nimplementer = "fake/legacy"\nreviewer = "fake/legacy-reviewer"\n\n[executor_adapter]\nimplementer = "fake/current"\nreviewer = "fake/current-reviewer"\n');
+  const mcp = startMcp({ FAKE_PI_SCENARIO: 'smoke-ready', HOME: home });
+  try {
+    await mcp.init();
+    const result = await mcp.callTool('smoke', {
+      executor: 'pi',
+      working_directory: repo,
+    });
+    assert.equal(result.isError, false);
+    assert.match(result.content[0].text, /model=fake\/current \(config:implementer\)/);
   } finally {
     mcp.close();
   }
@@ -410,7 +428,7 @@ test('non-zero dispatch classifies built-in provider API key errors', async () =
   }
 });
 
-test('large prompts warn and embed_context=false lists Trellis paths without inlining file bodies', async () => {
+test('large Trellis context is budgeted per file; embed_context=false lists paths', async () => {
   const repo = makeRepo({ trellis: true });
   const largeSpec = 'specs/large.md';
   fs.mkdirSync(path.join(repo, 'specs'), { recursive: true });
@@ -422,16 +440,15 @@ test('large prompts warn and embed_context=false lists Trellis paths without inl
   const mcp = startMcp();
   try {
     await mcp.init();
-    const dryRun = await mcp.callTool('dispatch', {
+    // Default embed_context=true: the 90 KB spec is truncated to the per-file
+    // Trellis context budget instead of being inlined whole.
+    const embedded = await mcp.callTool('preview_prompt', {
       mode: 'implement',
-      executor: 'pi',
-      model: 'fake/model',
       execution_mode: 'worktree',
       working_directory: repo,
       task_dir: taskDir,
-      dry_run: true,
     });
-    assert.match(dryRun.content[0].text, /WARN: Prompt is \d+ KB; large prompts can destabilize/);
+    assert.match(embedded.content[0].text, /truncated/);
 
     const listed = await mcp.callTool('preview_prompt', {
       mode: 'implement',
@@ -632,7 +649,9 @@ test('codex worktree dispatch returns patch_ready with usage and sandbox flags',
     assert.ok(argv, 'fake.argv event missing from output.log');
     assert.equal(argv[argv.indexOf('--sandbox') + 1], 'workspace-write');
     assert.ok(argv.includes('approval_policy="never"'));
-    assert.ok(argv.includes('--ignore-user-config'));
+    assert.ok(argv.includes('--ignore-rules'));
+    assert.ok(argv.includes('--ephemeral'));
+    assert.equal(argv.includes('--ignore-user-config'), false);
   } finally {
     mcp.close();
   }
@@ -662,14 +681,67 @@ test('codex review mode maps to a read-only sandbox', async () => {
   }
 });
 
-test('codex subprocess preserves Codex home but strips API keys', async () => {
+test('review mode with approval-flavored prose is review_completed, not blocked', async () => {
   const repo = makeRepo();
   const home = makePiHome();
-  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-adapter-codex-home-'));
+  const mcp = startMcp({ FAKE_CODEX_SCENARIO: 'review-report', HOME: home });
+  try {
+    await mcp.init();
+    const result = await mcp.callTool('dispatch', {
+      mode: 'custom',
+      executor: 'codex',
+      execution_mode: 'review',
+      working_directory: repo,
+      extra_instructions: 'Review the auth flow changes.',
+    });
+    assert.equal(result.isError, false);
+    const report = readReport(result);
+    assert.equal(report.status, 'done');
+    assert.equal(report.result_class, 'review_completed');
+    assert.equal(report.data_validation, 'not_applicable');
+    assert.match(report.status_reason, /Read-only review finished successfully/);
+    assert.ok(report.review_summary && report.review_summary.includes('Findings'));
+    const steps = report.orchestrator_next_steps.join('\n');
+    assert.match(steps, /review_summary/);
+    assert.doesNotMatch(steps, /Apply patch/);
+    assert.doesNotMatch(steps, /Run full validation/);
+  } finally {
+    mcp.close();
+  }
+});
+
+test('review prompt embeds git diff against base and states the read-only guard', async () => {
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, 'README.md'), '# test repo\n\nnew line\n', 'utf-8');
+  const mcp = startMcp();
+  try {
+    await mcp.init();
+    const result = await mcp.callTool('preview_prompt', {
+      mode: 'custom',
+      execution_mode: 'review',
+      working_directory: repo,
+      base: 'HEAD',
+      extra_instructions: 'Review the README change.',
+    });
+    const text = result.content[0].text;
+    assert.match(text, /Changes under review/);
+    assert.match(text, /README\.md/);
+    assert.match(text, /Do not modify, write, stage, commit, or push/);
+  } finally {
+    mcp.close();
+  }
+});
+
+test('codex subprocess uses local Codex home but strips API keys', async () => {
+  const repo = makeRepo();
+  const home = makePiHome();
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'executor-adapter-codex-home-'));
+  const codexConfigPath = path.join(codexHome, 'config.toml');
   const mcp = startMcp({
     FAKE_CODEX_SCENARIO: 'none',
     HOME: home,
     CODEX_HOME: codexHome,
+    CODEX_CONFIG_PATH: codexConfigPath,
     CODEX_API_KEY: 'secret-codex-key',
     OPENAI_API_KEY: 'secret-openai-key',
   });
@@ -686,6 +758,7 @@ test('codex subprocess preserves Codex home but strips API keys', async () => {
     const env = fakeEnvFrom(readReport(result));
     assert.ok(env, 'fake.env event missing from output.log');
     assert.equal(env.CODEX_HOME, codexHome);
+    assert.equal(env.CODEX_CONFIG_PATH, codexConfigPath);
     assert.equal(env.CODEX_API_KEY, null);
     assert.equal(env.OPENAI_API_KEY, null);
   } finally {
@@ -693,10 +766,10 @@ test('codex subprocess preserves Codex home but strips API keys', async () => {
   }
 });
 
-test('codex model resolution honors [pi_adapter.codex] and falls back to the CLI default', async () => {
+test('codex model resolution honors [executor_adapter.codex] and falls back to the CLI default', async () => {
   const repo = makeRepo();
   const configuredHome = makePiHome();
-  writePiConfig(configuredHome, '[pi_adapter]\nimplementer = "fake/pi"\n\n[pi_adapter.codex]\nimplementer = "gpt-5.5-codex"\n');
+  writePiConfig(configuredHome, '[executor_adapter]\nimplementer = "fake/pi"\n\n[executor_adapter.codex]\nimplementer = "gpt-5.5"\n');
   const configured = startMcp({ FAKE_CODEX_SCENARIO: 'none', HOME: configuredHome });
   try {
     await configured.init();
@@ -708,9 +781,9 @@ test('codex model resolution honors [pi_adapter.codex] and falls back to the CLI
       extra_instructions: 'Review only.',
     });
     assert.equal(result.isError, false);
-    assert.match(result.content[0].text, /Model: gpt-5\.5-codex \(config:implementer/);
+    assert.match(result.content[0].text, /Model: gpt-5\.5 \(config:implementer/);
     const argv = fakeArgvFrom(readReport(result));
-    assert.equal(argv[argv.indexOf('-m') + 1], 'gpt-5.5-codex');
+    assert.equal(argv[argv.indexOf('-m') + 1], 'gpt-5.5');
   } finally {
     configured.close();
   }
@@ -732,6 +805,39 @@ test('codex model resolution honors [pi_adapter.codex] and falls back to the CLI
     assert.equal(argv.includes('-m'), false);
   } finally {
     bare.close();
+  }
+});
+
+test('codex rejects executor backend aliases passed as model names', async () => {
+  const repo = makeRepo();
+  const home = makePiHome();
+  const mcp = startMcp({ FAKE_CODEX_SCENARIO: 'none', HOME: home });
+  try {
+    await mcp.init();
+    const dispatch = await mcp.callTool('dispatch', {
+      mode: 'custom',
+      executor: 'codex',
+      model: 'codex',
+      execution_mode: 'review',
+      working_directory: repo,
+      extra_instructions: 'Review only.',
+    });
+    assert.equal(dispatch.isError, true);
+    assert.match(dispatch.content[0].text, /Invalid Codex model "codex"/);
+    assert.match(dispatch.content[0].text, /executor="codex"/);
+    assert.match(dispatch.content[0].text, /omit model/);
+    assert.match(dispatch.content[0].text, /model="gpt-5\.5"/);
+
+    const smoke = await mcp.callTool('smoke', {
+      executor: 'codex',
+      model: 'codex',
+      working_directory: repo,
+    });
+    assert.equal(smoke.isError, true);
+    assert.match(smoke.content[0].text, /Invalid Codex model "codex"/);
+    assert.match(smoke.content[0].text, /executor="codex"/);
+  } finally {
+    mcp.close();
   }
 });
 
@@ -795,6 +901,26 @@ test('codex smoke passes when ready and reports the login hint on auth failure',
   }
 });
 
+test('codex smoke uses the same user config policy as isolated dispatch', async () => {
+  const repo = makeRepo();
+  const home = makePiHome();
+  const mcp = startMcp({ FAKE_CODEX_SCENARIO: 'smoke-ready', HOME: home });
+  try {
+    await mcp.init();
+    const result = await mcp.callTool('smoke', {
+      executor: 'codex',
+      working_directory: repo,
+    });
+    assert.equal(result.isError, false);
+    assert.match(result.content[0].text, /Codex smoke: PASSED/);
+    assert.match(result.content[0].text, /--ignore-rules/);
+    assert.match(result.content[0].text, /--ephemeral/);
+    assert.doesNotMatch(result.content[0].text, /--ignore-user-config/);
+  } finally {
+    mcp.close();
+  }
+});
+
 test('missing codex binary yields a clear error', async () => {
   const repo = makeRepo();
   const home = makePiHome();
@@ -813,5 +939,17 @@ test('missing codex binary yields a clear error', async () => {
     assert.match(result.content[0].text, /CODEX_BINARY/);
   } finally {
     mcp.close();
+  }
+});
+
+test('Claude Code agent templates pin xhigh effort for Task subagents', () => {
+  const templateDir = path.join(ROOT, 'templates', 'claude', 'agents');
+  for (const file of [
+    'trellis-codex-implement.md',
+    'trellis-pi-implement.md',
+    'trellis-pi-check.md',
+  ]) {
+    const body = fs.readFileSync(path.join(templateDir, file), 'utf-8');
+    assert.match(body, /^effort:\s*xhigh$/m, file);
   }
 });

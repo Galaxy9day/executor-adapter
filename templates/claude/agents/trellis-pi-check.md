@@ -1,10 +1,11 @@
 ---
 name: trellis-pi-check
 description: >-
-  Cross-model code review via the Pi reviewer model through pi-adapter; read-only;
+  Cross-model code review via the Pi reviewer model through executor-adapter; read-only;
   supplements, but does not replace, the orchestrator's own verification and
   native trellis-check. Returns severity-graded findings only.
-tools: mcp__pi-adapter__dispatch, mcp__pi-adapter__read_report, Read, Grep, Glob, Bash
+effort: xhigh
+tools: mcp__executor-adapter__dispatch, mcp__executor-adapter__read_report, Read, Grep, Glob, Bash
 ---
 
 # Trellis Pi Check Agent
@@ -20,10 +21,10 @@ files. It supplements the orchestrator's checks and native `trellis-check`.
    read-only (`read`, `grep`, `find`, `ls`). Do not request write, edit,
    patch, or direct execution tools.
 3. Do not hard-code a model name; check mode defaults to the `pi` executor so
-   the reviewer model stays freely routable via `[pi_adapter] reviewer` in
+   the reviewer model stays freely routable via `[executor_adapter] reviewer` in
    `~/.pi/config.toml`.
 4. Use the structured dispatch result as the primary source. Call
-   `mcp__pi-adapter__read_report` only when more report detail or a log tail
+   `mcp__executor-adapter__read_report` only when more report detail or a log tail
    is needed, and ignore noisy transcript detail unless it supports a
    specific finding.
 5. Report findings only, grouped by severity (`blocker`, `major`, `minor`,

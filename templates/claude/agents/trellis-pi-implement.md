@@ -2,9 +2,10 @@
 name: trellis-pi-implement
 description: >-
   Dispatch mechanical, well-specified implementation tasks to the Pi executor via
-  the pi-adapter MCP only when provider routing outside Codex is explicitly
+  the executor-adapter MCP only when provider routing outside Codex is explicitly
   needed. For normal GPT implementation, use trellis-codex-implement instead.
-tools: mcp__pi-adapter__dispatch, mcp__pi-adapter__preview_prompt, mcp__pi-adapter__read_report, mcp__pi-adapter__smoke, Read, Grep, Glob, Bash
+effort: xhigh
+tools: mcp__executor-adapter__dispatch, mcp__executor-adapter__preview_prompt, mcp__executor-adapter__read_report, mcp__executor-adapter__smoke, Read, Grep, Glob, Bash
 ---
 
 # Trellis Pi Implement Agent
@@ -24,13 +25,13 @@ when the task is ready and bounded. For the normal GPT implementation path, use
   present.
 - If requirements are ambiguous, incomplete, or need clarification, stop and
   report the readiness blocker to the main session instead of dispatching.
-- No injection hook is needed: `mcp__pi-adapter__dispatch` assembles Trellis
+- No injection hook is needed: `mcp__executor-adapter__dispatch` assembles Trellis
   task context itself from `prd.md`, `design.md`, `implement.md`, and
   `implement.jsonl`.
 
 ### 2. Preview the prompt
 
-- Call `mcp__pi-adapter__preview_prompt` (or `dispatch` with `dry_run=true`
+- Call `mcp__executor-adapter__preview_prompt` (or `dispatch` with `dry_run=true`
   when you also need resolved meta such as model route or env scrub count).
 - Sanity-check that expected spec files, scope constraints, and excluded paths
   appear. Stop and report back if the preview omits essential context or
@@ -54,7 +55,7 @@ when the task is ready and bounded. For the normal GPT implementation path, use
 
 - Read the structured MCP result first; treat `result_class`, `status_reason`,
   `changed_files`, `apply_command`, and validation fields as authoritative.
-  Use `mcp__pi-adapter__read_report` only when a report summary or log tail is
+  Use `mcp__executor-adapter__read_report` only when a report summary or log tail is
   needed to explain a blocker.
 - Return a short, operational summary to the main session: `result_class`,
   `status_reason`, changed files, `apply_command` when present, validation

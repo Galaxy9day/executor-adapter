@@ -1,5 +1,5 @@
 /**
- * Executor backends for pi-adapter.
+ * Executor backends for executor-adapter.
  *
  * Each executor describes how to discover its binary, scrub the child
  * environment, resolve models from ~/.pi/config.toml, build spawn argv,
@@ -14,7 +14,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 
-const SERVER_NAME = 'pi-adapter';
+const SERVER_NAME = 'executor-adapter';
 
 function logErr(msg) {
   process.stderr.write(`[${SERVER_NAME}] ${msg}\n`);
@@ -45,9 +45,9 @@ export function loadAdapterConfig() {
   if (raw) {
     try {
       const parsed = TOML.parse(raw);
-      // Preferred section name + legacy alias (skill was previously named
-      // trellis-pi-adapter). New keys win when both exist.
-      const sections = [parsed.pi_adapter, parsed.trellis_pi_adapter];
+      // Preferred section name + legacy aliases. New keys win when multiple
+      // sections exist.
+      const sections = [parsed.executor_adapter, parsed.pi_adapter, parsed.trellis_pi_adapter];
       let legacyUsed = false;
       for (const section of sections) {
         if (!section || typeof section !== 'object' || Array.isArray(section)) continue;
@@ -59,7 +59,7 @@ export function loadAdapterConfig() {
           }
           if (!(k in config.pi)) {
             config.pi[k] = v;
-            if (section === parsed.trellis_pi_adapter) legacyUsed = true;
+            if (section !== parsed.executor_adapter) legacyUsed = true;
           }
         }
         const codexSection = section.codex;
@@ -71,7 +71,7 @@ export function loadAdapterConfig() {
         }
       }
       if (legacyUsed) {
-        logErr('reading legacy [trellis_pi_adapter] TOML section — rename to [pi_adapter] when convenient.');
+        logErr('reading legacy [pi_adapter]/[trellis_pi_adapter] TOML section — rename to [executor_adapter] when convenient.');
       }
     } catch (e) {
       logErr(`TOML parse error in ${cfgPath}: ${e.message}`);
@@ -84,13 +84,23 @@ export function loadAdapterConfig() {
 
 export class ModelResolutionError extends Error {
   constructor(logicalKey) {
-    super(`Cannot resolve model "${logicalKey}". Configure ~/.pi/config.toml:\n\n  [pi_adapter]\n  implementer = "<your-pi-routable-model>"   # required for mode=implement|custom\n  reviewer    = "<your-pi-routable-model>"   # required for mode=check / cross-model review\n\nOr pass a fully qualified route directly, e.g. model="anthropic/claude-opus-4-7".`);
+    super(`Cannot resolve model "${logicalKey}". Configure ~/.pi/config.toml:\n\n  [executor_adapter]\n  implementer = "<your-pi-routable-model>"   # required for mode=implement|custom\n  reviewer    = "<your-pi-routable-model>"   # required for mode=check / cross-model review\n\nOr pass a fully qualified route directly, e.g. model="anthropic/claude-opus-4-7".`);
     this.code = 'MODEL_NOT_RESOLVED';
     this.logicalKey = logicalKey;
   }
 }
 
+export class InvalidCodexModelError extends Error {
+  constructor(model) {
+    super(`Invalid Codex model "${model}": "codex" is the executor backend name, not a model. Use executor="codex" and omit model to use the Codex CLI default from $CODEX_HOME/config.toml, or pass a real Codex model id such as model="gpt-5.5".`);
+    this.code = 'INVALID_CODEX_MODEL';
+    this.model = model;
+  }
+}
+
 // ---- Shared subprocess helpers ----
+
+const CODEX_BACKEND_ALIASES = new Set(['codex', 'pi', 'executor-adapter', 'pi-adapter']);
 
 // Explicit env override is authoritative: a configured-but-missing path is an
 // error, not a trigger for silent PATH fallback.
@@ -120,12 +130,6 @@ function scrubEnv(parentEnv, keepPattern) {
     out[k] = v;
   }
   return { env: out, stripped };
-}
-
-function approvalBlocked(text) {
-  const t = text || '';
-  return /approval|approve|permission|confirm|non[- ]interactive|no ui|stdin|tty/i.test(t) &&
-    /blocked|required|waiting|denied|refused|unavailable|cannot|can't|failed/i.test(t);
 }
 
 function codexSandbox(executionMode) {
@@ -189,7 +193,6 @@ const pi = {
     if (String(stderr || '').trim()) output += (output ? '\n\n--- stderr ---\n' : '') + stderr.trim();
     let runStatus;
     if (killed) runStatus = 'timeout';
-    else if (approvalBlocked(output)) runStatus = 'blocked';
     else runStatus = exitCode === 0 ? 'done' : 'failed';
     return { runStatus, output, usage: null };
   },
@@ -229,9 +232,9 @@ const codex = {
   sandboxFor: codexSandbox,
 
   buildEnv(parentEnv) {
-    // Codex authenticates via ~/.codex/auth.json (saved `codex login`);
-    // API keys are deliberately not forwarded. Keep only Codex state-location
-    // variables so users can point the subprocess at a dedicated auth home.
+    // Codex uses the current machine's CODEX_HOME for config.toml + auth.json.
+    // API keys are deliberately not forwarded; each host should provide its
+    // own local Codex credentials/provider config.
     return scrubEnv(parentEnv, /^CODEX_(HOME|SQLITE_HOME)$/);
   },
 
@@ -239,6 +242,10 @@ const codex = {
     const defaultKey = mode === 'check' ? 'reviewer' : 'implementer';
     const map = loadAdapterConfig().codex;
     const logicalKey = input || defaultKey;
+    if (input) {
+      const normalized = String(input).trim().toLowerCase();
+      if (CODEX_BACKEND_ALIASES.has(normalized)) throw new InvalidCodexModelError(input);
+    }
     if (map[logicalKey]) return { resolved: map[logicalKey], from: 'config', key: logicalKey };
     if (input) return { resolved: input, from: 'direct', key: null };
     // No config and no explicit model: defer to the codex CLI's own
@@ -255,7 +262,10 @@ const codex = {
         '--sandbox', sandbox,
         ...(model ? ['-m', model] : []),
         ...(thinking ? ['-c', `model_reasoning_effort="${thinking}"`] : []),
-        ...(isolate ? ['--ignore-user-config', '--ignore-rules', '--ephemeral'] : []),
+        // Keep the user's Codex config so custom providers/base_url/auth mode
+        // match `codex exec` and smoke. `--ignore-user-config` would silently
+        // fall back to the built-in OpenAI provider while still reading auth.
+        ...(isolate ? ['--ignore-rules', '--ephemeral'] : []),
         '-o', worker.lastMessagePath,
         '-',
       ],
@@ -298,7 +308,6 @@ const codex = {
     if (String(stderr || '').trim()) output += (output ? '\n\n--- stderr ---\n' : '') + stderr.trim();
     let runStatus;
     if (killed) runStatus = 'timeout';
-    else if (approvalBlocked(output)) runStatus = 'blocked';
     else if (errors.length > 0 || exitCode !== 0) runStatus = 'failed';
     else runStatus = 'done';
     return { runStatus, output, usage };
@@ -307,10 +316,10 @@ const codex = {
   failureHint(stderr, stdout) {
     const combined = `${stderr || ''}\n${stdout || ''}`;
     if (/not logged in|login required|run codex login/i.test(combined)) {
-      return 'Codex is not authenticated. Run `codex login` once (auth is read from ~/.codex/auth.json; API keys are not forwarded to the subprocess).';
+      return 'Codex is not authenticated on this machine. Run `codex login` once or fix `$CODEX_HOME/config.toml`/`auth.json`; API keys are not forwarded to the subprocess.';
     }
     if (/model .*(not found|not supported)|unknown model/i.test(combined)) {
-      return 'Codex rejected the model name. Check the `-m` value or the [pi_adapter.codex] section in ~/.pi/config.toml; omit model to use the codex CLI default.';
+      return 'Codex rejected the model name. Check the `-m` value or the [executor_adapter.codex] section in ~/.pi/config.toml; omit model to use the codex CLI default.';
     }
     if (/sandbox|seatbelt|landlock|permission denied/i.test(combined)) {
       return 'The codex OS sandbox blocked an operation. Check whether the execution_mode→sandbox mapping (review/patch=read-only, worktree/direct=workspace-write) matches what the task needs.';
@@ -324,6 +333,8 @@ const codex = {
         'exec', '--json',
         '--sandbox', 'read-only',
         '-c', 'approval_policy="never"',
+        '--ignore-rules',
+        '--ephemeral',
         ...(model ? ['-m', model] : []),
         'Respond with exactly the string: CODEX READY. No other words.',
       ],
@@ -341,7 +352,7 @@ export function resolveExecutor(explicit, mode) {
   const pick = explicit || loadAdapterConfig().defaultExecutor;
   if (pick) {
     if (!EXECUTORS[pick]) {
-      throw new Error(`Unknown executor "${pick}". Use "pi" or "codex" (dispatch param or [pi_adapter] default_executor in ~/.pi/config.toml).`);
+      throw new Error(`Unknown executor "${pick}". Use "pi" or "codex" (dispatch param or [executor_adapter] default_executor in ~/.pi/config.toml).`);
     }
     return pick;
   }

@@ -1,21 +1,21 @@
 {
-  "name": "@galaxy9day/pi-adapter",
-  "version": "0.9.0",
-  "description": "Dual-executor MCP (Codex CLI for GPT implementation, Pi CLI for cross-model review) for Trellis-aware and standalone use. Reads Trellis task artifacts, runs the executor in an isolated subprocess/worktree, and can optionally emit non-invasive Trellis channel audit messages.",
+  "name": "@galaxy9day/executor-adapter",
+  "version": "0.10.3",
+  "description": "Multi-executor MCP (Codex CLI for GPT implementation, Pi CLI for cross-model review) for Trellis-aware and standalone use. Reads Trellis task artifacts, runs the executor in an isolated subprocess/worktree, and can optionally emit non-invasive Trellis channel audit messages.",
   "type": "module",
   "main": "index.js",
   "bin": {
-    "pi-adapter": "index.js"
+    "executor-adapter": "index.js"
   },
   "scripts": {
     "start": "node index.js",
     "test": "node --test test/*.test.js",
-    "smoke": "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"pi-adapter-smoke\",\"version\":\"0.0.0\"}}}\\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\\n' | node index.js"
+    "smoke": "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"executor-adapter-smoke\",\"version\":\"0.0.0\"}}}\\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\\n' | node index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
     "@iarna/toml": "^2.2.5",
-    "@mindfoldhq/trellis-core": "^0.6.0-beta.13"
+    "@mindfoldhq/trellis-core": "^0.6.9",
+    "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "engines": {
     "node": ">=20"
@@ -31,10 +31,10 @@
     "mcp",
     "model-context-protocol",
     "claude-code",
-    "pi",
-    "pi-coder",
     "codex",
     "codex-cli",
+    "pi",
+    "pi-coder",
     "trellis",
     "channel-audit",
     "ai-agent",
@@ -43,13 +43,13 @@
   ],
   "author": "galaxy9day (https://github.com/Galaxy9day)",
   "license": "AGPL-3.0-only",
-  "homepage": "https://github.com/Galaxy9day/pi-adapter#readme",
+  "homepage": "https://github.com/Galaxy9day/executor-adapter#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Galaxy9day/pi-adapter.git"
+    "url": "git+https://github.com/Galaxy9day/executor-adapter.git"
   },
   "bugs": {
-    "url": "https://github.com/Galaxy9day/pi-adapter/issues"
+    "url": "https://github.com/Galaxy9day/executor-adapter/issues"
   },
   "publishConfig": {
     "access": "public"

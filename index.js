@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * pi-adapter MCP server
+ * executor-adapter MCP server
  *
  * Executor adapter (Pi CLI + Codex CLI backends) for Trellis Phase 2.1 and
  * standalone use. Executor-specific behavior lives in executors.js; routing
@@ -14,7 +14,7 @@
  *   audit trail belongs to Trellis core (worker_guard and event log are
  *   Trellis's, not ours).
  * - Standalone: the main Agent invokes this MCP directly; runtime files
- *   live under `/tmp/pi-adapter/`.
+ *   live under `/tmp/executor-adapter/`.
  *
  * Forward compatibility:
  * - `@mindfoldhq/trellis-core/channel` is loaded via dynamic import in a
@@ -43,13 +43,14 @@ import { EXECUTORS, resolveExecutor } from './executors.js';
 
 // ---- Constants ----
 
-const SERVER_NAME = 'pi-adapter';
-const SERVER_VERSION = '0.9.0';  // keep in sync with package.json
+const SERVER_NAME = 'executor-adapter';
+const LEGACY_SERVER_NAMES = ['pi-adapter'];
+const SERVER_VERSION = '0.10.3';  // keep in sync with package.json
 const TMP_RUNTIME_DIR = path.join(os.tmpdir(), SERVER_NAME);
 const CHANNEL_ENV_ALIASES = ['TRELLIS_CHANNEL', 'TRELLIS_CHANNEL_NAME'];
 const TRELLIS_BIN_ENV = 'TRELLIS_BINARY';
 const DEFAULT_WRITE_TOOLS = 'read,bash,edit,write,grep,find,ls';
-const DEFAULT_READ_TOOLS = 'read,grep,find,ls';
+const DEFAULT_READ_TOOLS = 'read,bash,grep,find,ls';
 const DEFAULT_PATCH_TOOLS = 'read,bash,grep,find,ls';
 const PROMPT_SIZE_WARN_BYTES = 80 * 1024;
 
@@ -86,6 +87,11 @@ function resolveRuntimeDir(workDir) {
     return path.join(workDir, '.trellis', '.runtime');
   }
   return TMP_RUNTIME_DIR;
+}
+
+function legacyRuntimeDirs(workDir) {
+  if (fs.existsSync(path.join(workDir, '.trellis'))) return [];
+  return LEGACY_SERVER_NAMES.map(name => path.join(os.tmpdir(), name));
 }
 
 function detectProjectMode(workDir, channelName, executionMode) {
@@ -160,7 +166,19 @@ function detectChannel(args, env) {
 async function emitChannelEvent(channelName, eventName, payload, workDir) {
   if (!channelName) return { ok: true, reason: 'no-channel' };
 
-  const meta = { schema: 'pi-adapter.dispatch.v1', ...payload };
+  // meta carries the event name (trellis-core 0.6.x dropped the sendMessage
+  // `tag` option) plus a workDir-relative task path so a channel reader on
+  // another host or a symlinked checkout can resolve it.
+  const meta = { schema: 'executor-adapter.dispatch.v1', legacy_schema: 'pi-adapter.dispatch.v1', event: eventName, ...payload };
+  if (meta.task && workDir && path.isAbsolute(String(meta.task))) {
+    const rel = path.relative(workDir, String(meta.task));
+    if (rel && !rel.startsWith('..')) meta.task = rel;
+  }
+  // Stable per-(worker, event) key: trellis-core 0.6.x appendEvent dedups on
+  // idempotencyKey + kind, so retries don't double-append the same bookend.
+  const idempotencyKey = meta.worker_id
+    ? `executor-adapter:${meta.worker_id}:${eventName}`
+    : `executor-adapter:${eventName}:${crypto.randomUUID()}`;
 
   const sendMessage = await getTrellisCoreSendMessage();
   if (sendMessage) {
@@ -170,7 +188,7 @@ async function emitChannelEvent(channelName, eventName, payload, workDir) {
         cwd: workDir,
         by: SERVER_NAME,
         text: `${SERVER_NAME}: ${eventName}`,
-        tag: `pi:${eventName}`,
+        idempotencyKey,
         meta,
       }), 2000, 'trellis-core sendMessage');
       return { ok: true, via: 'trellis-core' };
@@ -372,6 +390,26 @@ function fencedContent(label, content) {
   return `### ${label}\n\n~~~text\n${String(content || '')}\n~~~\n\n`;
 }
 
+// Embed Trellis context within a per-file and total budget (mirroring the
+// Trellis 0.6.x sub-agent context caps). Over-budget files are truncated to a
+// leading summary; once the total budget is exhausted, later files are listed
+// by path only so the executor reads them from the worktree on demand.
+const CONTEXT_PER_FILE_BYTES = 32 * 1024;
+const CONTEXT_TOTAL_BYTES = 128 * 1024;
+
+function fencedContentBudgeted(label, content, budget) {
+  const text = String(content || '');
+  if (budget.embeddedBytes >= budget.totalCap) {
+    return `### ${label}\n\n(omitted: Trellis context budget exceeded; read this file from the worktree)\n\n`;
+  }
+  const cap = Math.min(budget.perFileCap, budget.totalCap - budget.embeddedBytes);
+  const trimmed = text.length > cap
+    ? `${text.slice(0, cap)}\n...[truncated ${text.length - cap} chars; full file is in the worktree]`
+    : text;
+  budget.embeddedBytes += trimmed.length;
+  return `### ${label}\n\n~~~text\n${trimmed}\n~~~\n\n`;
+}
+
 function readContextFiles(repoRoot, contextFiles) {
   const files = [];
   if (!Array.isArray(contextFiles)) return files;
@@ -394,7 +432,7 @@ function appendContextFilesPrompt(prompt, contextFiles) {
 }
 
 function buildDispatchPrompt(args) {
-  const { taskDir, artifacts, manifest, manifestFile, mode } = args;
+  const { taskDir, artifacts, manifest, manifestFile, mode, reviewDiff } = args;
   const executionMode = args.execution_mode || defaultExecutionMode(mode);
   const extraInstructions = args.extra_instructions || '';
   const scopeConstraint = args.scope || '';
@@ -425,9 +463,10 @@ function buildDispatchPrompt(args) {
   if (manifest.files.length > 0 || Object.keys(artifacts).length > 0) {
     p += `\n## Embedded Trellis Context\n\n`;
     if (embedContext) {
-      p += `These are embedded so isolated executor workers can run from a clean worktree without depending on uncommitted task files.\n\n`;
-      for (const f of manifest.files) p += fencedContent(f.path, f.content);
-      for (const [name, content] of Object.entries(artifacts)) p += fencedContent(`${taskDir}/${name}`, content);
+      p += `These are embedded so isolated executor workers can run from a clean worktree without depending on uncommitted task files. Each file is capped and the total is bounded to keep the prompt within Trellis 0.6.x sub-agent context limits.\n\n`;
+      const budget = { embeddedBytes: 0, perFileCap: CONTEXT_PER_FILE_BYTES, totalCap: CONTEXT_TOTAL_BYTES };
+      for (const f of manifest.files) p += fencedContentBudgeted(f.path, f.content, budget);
+      for (const [name, content] of Object.entries(artifacts)) p += fencedContentBudgeted(`${taskDir}/${name}`, content, budget);
     } else {
       p += `Context embedding is disabled. Read these paths on demand from the worktree before editing:\n\n`;
       for (const f of manifest.files) p += `- \`${f.path}\`\n`;
@@ -444,7 +483,11 @@ function buildDispatchPrompt(args) {
   } else if (executionMode === 'patch') {
     p += `\n## Execution Environment\n\nDo not edit files directly. Produce a unified diff in your final answer that the orchestrator can review and apply.\n\n`;
   } else if (executionMode === 'review') {
-    p += `\n## Execution Environment\n\nRead-only review mode. Do not modify files. Report findings and recommended fixes only.\n\n`;
+    p += `\n## Execution Environment\n\nRead-only review mode. Do not modify, write, stage, commit, or push anything; run only read-only inspections such as \`git diff\`, \`git log\`, \`grep\`, or \`cat\`. Report findings and recommended fixes only.\n`;
+    if (reviewDiff) {
+      p += `\n### Changes under review (\`git diff ${reviewDiff.ref}\`)\n\n~~~text\n${reviewDiff.stat}\n~~~\n\nKey diff:\n\n~~~diff\n${reviewDiff.snippet}\n~~~\n`;
+    }
+    p += `\n`;
   }
   if (validationCommands.length > 0) {
     p += `\n## Verification Commands\n\nRun these before reporting done:\n\n`;
@@ -454,7 +497,7 @@ function buildDispatchPrompt(args) {
   return p;
 }
 
-function buildNoTrellisPrompt(mode, extraInstructions, scope, validationCommands, executionMode = defaultExecutionMode(mode), contextFiles = []) {
+function buildNoTrellisPrompt(mode, extraInstructions, scope, validationCommands, executionMode = defaultExecutionMode(mode), contextFiles = [], reviewDiff = null) {
   const modeLabel = mode === 'check' ? 'Quality Check' : mode === 'custom' ? 'Custom' : 'Implementation';
   let p = `# Executor Dispatch: ${modeLabel} (no Trellis)\n\n`;
   if (mode === 'implement') {
@@ -472,7 +515,11 @@ function buildNoTrellisPrompt(mode, extraInstructions, scope, validationCommands
   } else if (executionMode === 'patch') {
     p += `## Execution Environment\n\nDo not edit files directly. Produce a unified diff in your final answer that the orchestrator can review and apply.\n\n`;
   } else if (executionMode === 'review') {
-    p += `## Execution Environment\n\nRead-only review mode. Do not modify files. Report findings and recommended fixes only.\n\n`;
+    p += `## Execution Environment\n\nRead-only review mode. Do not modify, write, stage, commit, or push anything; run only read-only inspections such as \`git diff\`, \`git log\`, \`grep\`, or \`cat\`. Report findings and recommended fixes only.\n`;
+    if (reviewDiff) {
+      p += `\n### Changes under review (\`git diff ${reviewDiff.ref}\`)\n\n~~~text\n${reviewDiff.stat}\n~~~\n\nKey diff:\n\n~~~diff\n${reviewDiff.snippet}\n~~~\n`;
+    }
+    p += `\n`;
   }
   if (validationCommands && validationCommands.length > 0) {
     p += `## Verification Commands\n\n`;
@@ -725,6 +772,32 @@ function hasUsablePatch(executionMode, diffInfo, changedFiles) {
   return Boolean(diffInfo && diffInfo.ok && Array.isArray(changedFiles) && changedFiles.length > 0);
 }
 
+// Best-effort diff capture for read-only review. Review runs in the main repo,
+// so surface what changed vs `base` so the reviewer does not have to guess the
+// diff. Any failure (missing ref, non-repo) is silent — the prompt still works.
+function captureReviewDiff(workDir, base) {
+  const ref = base || 'main';
+  const run = (args, maxBuffer) => {
+    try {
+      return execFileSync('git', args, {
+        cwd: workDir,
+        encoding: 'utf-8',
+        timeout: 15000,
+        maxBuffer,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+    } catch {
+      return '';
+    }
+  };
+  const stat = run(['diff', '--stat', ref], 1024 * 1024);
+  if (!stat) return null;
+  const diff = run(['diff', ref], 20 * 1024 * 1024);
+  const cap = 16000;
+  const snippet = diff.length > cap ? `${diff.slice(0, cap)}\n...[diff truncated, ${diff.length} chars total]` : diff;
+  return { ref, stat, snippet };
+}
+
 function detectsDataValidationUnavailable(output) {
   const text = output || '';
   return [
@@ -749,6 +822,32 @@ function validationScopeText(validation, limitedDataValidation) {
 }
 
 function classifyResult({ executionMode, status, finalStatus, exitCode, validation, diffInfo, changedFiles, output }) {
+  // Read-only review is success-oriented: finalStatus 'done' means the review
+  // ran to completion, regardless of patch/worktree post-conditions — nothing
+  // is supposed to change. This sidesteps approvalBlocked misfiring on normal
+  // review prose and skips patch-only checks (changed_files, min_diff_lines,
+  // usablePatch, validation.passed) that do not apply to a read-only run.
+  if (executionMode === 'review') {
+    if (finalStatus === 'done') {
+      return {
+        status: 'done',
+        result_class: 'review_completed',
+        status_reason: 'Read-only review finished successfully.',
+        data_validation: 'not_applicable',
+        data_validation_reason: 'Review mode does not modify files; data validation is not applicable.',
+      };
+    }
+    return {
+      status: finalStatus,
+      result_class: finalStatus === 'blocked' ? 'blocked' : 'failed',
+      status_reason: finalStatus === 'blocked'
+        ? 'The review executor hit an approval/permission blocker.'
+        : 'The review executor did not complete successfully.',
+      data_validation: 'not_applicable',
+      data_validation_reason: 'Review mode does not modify files.',
+    };
+  }
+
   const usablePatch = hasUsablePatch(executionMode, diffInfo, changedFiles);
   const limitedDataValidation = usablePatch && validation?.passed && exitCode === 0 && detectsDataValidationUnavailable(output);
 
@@ -813,7 +912,72 @@ function classifyResult({ executionMode, status, finalStatus, exitCode, validati
   };
 }
 
-function buildOrchestratorNextSteps({ resultClass, projectMode, applyCommand, validationCommands = [] }) {
+function extractReviewSummary(output, cap = 4000) {
+  const text = String(output || '').trim();
+  if (!text) return '';
+  // Review verdicts/findings live at the tail; cap to keep report.json small.
+  // The full executor output always remains available in output.log.
+  return text.length > cap ? text.slice(-cap) : text;
+}
+
+// ---- v2 orthogonal outcome model (replaces result_class + data_validation state machine) ----
+// The adapter reports facts, not workflow opinions. `ok` is the single success
+// signal (isError = !ok); run_status / patch / post_validation are independent.
+
+const POST_VALIDATION_CHECKS = ['min_files_changed', 'required_paths_modified', 'forbidden_paths', 'min_diff_lines'];
+
+function configuredValidationChecks(params) {
+  return POST_VALIDATION_CHECKS.filter((name) => {
+    if (name === 'min_files_changed') return typeof params.min_files_changed === 'number';
+    if (name === 'required_paths_modified') return Array.isArray(params.required_paths_modified) && params.required_paths_modified.length > 0;
+    if (name === 'forbidden_paths') return Array.isArray(params.forbidden_paths) && params.forbidden_paths.length > 0;
+    if (name === 'min_diff_lines') return typeof params.min_diff_lines === 'number';
+    return false;
+  });
+}
+
+function buildPostValidation(executionMode, raw, params) {
+  const checks = configuredValidationChecks(params);
+  if (executionMode === 'review') return { status: 'skipped', failures: [], checks };
+  if (!raw || raw.skipped) return { status: 'skipped', failures: [], checks };
+  return { status: raw.passed ? 'passed' : 'failed', failures: raw.failures || [], checks };
+}
+
+function buildPatch(executionMode, diffInfo, changedFiles, patchPath) {
+  if (executionMode !== 'worktree') {
+    return { status: 'not_applicable', has_patch: false, file: null, changed_files: [], error: null };
+  }
+  if (!diffInfo || !diffInfo.ok) {
+    return { status: 'export_failed', has_patch: false, file: patchPath, changed_files: [], error: (diffInfo && diffInfo.error) || 'diff export failed' };
+  }
+  const changed = Array.isArray(changedFiles) ? changedFiles : [];
+  if (changed.length === 0) return { status: 'none', has_patch: false, file: patchPath, changed_files: [], error: null };
+  return { status: 'ready', has_patch: true, file: patchPath, changed_files: changed, error: null };
+}
+
+// ok: single source of truth for success. isError = !ok. Orthogonal facts only.
+function computeOk(runStatus, patch, postValidation) {
+  if (runStatus !== 'done') return false;
+  if (postValidation.status === 'failed') return false;
+  if (patch.status === 'none' || patch.status === 'export_failed') return false;
+  return true;
+}
+
+function buildOrchestratorNextSteps({ resultClass, projectMode, applyCommand, validationCommands = [], executionMode }) {
+  if (executionMode === 'review') {
+    if (resultClass === 'review_completed') {
+      return [
+        'Inspect report.json and review_summary',
+        'Extract findings and decide next action',
+        'If fixes are needed, dispatch again with mode=implement',
+      ];
+    }
+    return [
+      'Inspect report.json and output.log',
+      'Diagnose why the review executor did not complete',
+      'Re-dispatch once the executor can run to completion',
+    ];
+  }
   if (resultClass === 'no_usable_patch') {
     return ['Inspect report/log', 'Tighten scope or instructions', 'Re-dispatch or fix manually'];
   }
@@ -934,6 +1098,14 @@ function runtimeWorkersDir(runtimeDir) {
   return path.join(runtimeDir, 'pi-workers');
 }
 
+function existingRuntimeWorkersDirs(runtimeDir, workDir) {
+  const dirs = [runtimeWorkersDir(runtimeDir)];
+  for (const legacy of legacyRuntimeDirs(workDir)) {
+    dirs.push(runtimeWorkersDir(legacy));
+  }
+  return [...new Set(dirs)];
+}
+
 function removeWorkerRuntime(workerDir, workDir) {
   const repoDir = path.join(workerDir, 'repo');
   if (fs.existsSync(repoDir)) {
@@ -958,7 +1130,7 @@ async function dispatch(args) {
     working_directory: cwd,
     executor: executorInput,
     model: modelInput,
-    thinking = 'high',
+    thinking = 'xhigh',
     tools: toolsInput,
     execution_mode: executionModeInput,
     isolate_executor,
@@ -975,6 +1147,7 @@ async function dispatch(args) {
     required_paths_modified,
     forbidden_paths,
     min_diff_lines,
+    base = 'main',
   } = args;
 
   const isolateExecutor = isolate_executor ?? isolate_pi ?? true;
@@ -1019,14 +1192,16 @@ async function dispatch(args) {
     taskDir = resolveActiveTask(workDir, trellis_context_id);
   }
 
+  const reviewDiff = executionMode === 'review' ? captureReviewDiff(workDir, base) : null;
+
   let context = null;
   let promptBody = '';
   if (taskDir) {
     context = assembleTrellisContext(workDir, taskDir, mode);
-    promptBody = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands, context_files: readContextFiles(workDir, context_files), embed_context });
+    promptBody = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands, context_files: readContextFiles(workDir, context_files), embed_context, reviewDiff });
   } else if (mode === 'custom') {
     if (!extra_instructions) return { content: [{ type: 'text', text: 'Error: custom mode requires extra_instructions.' }], isError: true };
-    promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode, readContextFiles(workDir, context_files));
+    promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode, readContextFiles(workDir, context_files), reviewDiff);
   } else {
     if (!extra_instructions) {
       return {
@@ -1034,7 +1209,7 @@ async function dispatch(args) {
         isError: true,
       };
     }
-    promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode, readContextFiles(workDir, context_files));
+    promptBody = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode, readContextFiles(workDir, context_files), reviewDiff);
   }
 
   const runtimeDir = resolveRuntimeDir(workDir);
@@ -1259,6 +1434,7 @@ async function dispatch(args) {
         projectMode,
         applyCommand,
         validationCommands: validation_commands,
+        executionMode,
       });
       const report = {
         worker_id: workerId,
@@ -1296,6 +1472,7 @@ async function dispatch(args) {
         apply_command: applyCommand,
         worker_repo: executionMode === 'worktree' ? worker.repoDir : null,
         diff: diffInfo,
+        ...(executionMode === 'review' ? { review_summary: extractReviewSummary(output) } : {}),
         finished_at: new Date().toISOString(),
       };
       writeJsonFile(reportPath, report);
@@ -1515,6 +1692,10 @@ function candidateWorkerDirs(args) {
   if (worker_id) {
     const base = working_directory ? resolveRuntimeDir(resolvePath(working_directory)) : TMP_RUNTIME_DIR;
     dirs.push(path.join(base, 'pi-workers', worker_id));
+    const workDir = working_directory ? resolvePath(working_directory) : process.cwd();
+    for (const legacy of legacyRuntimeDirs(workDir)) {
+      dirs.push(path.join(legacy, 'pi-workers', worker_id));
+    }
   }
   return [...new Set(dirs)];
 }
@@ -1549,6 +1730,12 @@ function summarizeReport(report, reportPath) {
   if (report.validation_scope) text += `validation_scope: ${report.validation_scope}\n`;
   if (report.data_validation) text += `data_validation: ${report.data_validation}\n`;
   if (report.data_validation_reason) text += `data_validation_reason: ${report.data_validation_reason}\n`;
+  if (typeof report.review_summary === 'string' && report.review_summary) {
+    const snip = report.review_summary.length > 800
+      ? `${report.review_summary.slice(0, 800)}\n... (${report.review_summary.length - 800} more chars in report.json)`
+      : report.review_summary;
+    text += `review_summary:\n${snip}\n`;
+  }
   if (report.apply_command) text += `apply_command: ${report.apply_command}\n`;
   if (changed.length > 0) {
     text += `changed_files (${changed.length}):\n`;
@@ -1605,15 +1792,16 @@ function cleanupRuntime(args) {
   } = args;
   const workDir = working_directory || process.cwd();
   const runtimeDir = resolveRuntimeDir(workDir);
-  const workersDir = runtimeWorkersDir(runtimeDir);
+  const workersDirs = existingRuntimeWorkersDirs(runtimeDir, workDir);
   const retainMs = Math.max(0, Number(retain_days) || 0) * 24 * 60 * 60 * 1000;
   const cutoff = Date.now() - retainMs;
+  const existingWorkersDirs = workersDirs.filter(dir => fs.existsSync(dir));
 
-  if (!fs.existsSync(workersDir)) {
+  if (existingWorkersDirs.length === 0) {
     return {
       content: [{
         type: 'text',
-        text: JSON.stringify({ runtime_dir: runtimeDir, workers_dir: workersDir, dry_run, removed: [], retained: [], bytes_freed: 0 }, null, 2),
+        text: JSON.stringify({ runtime_dir: runtimeDir, workers_dirs: workersDirs, dry_run, removed: [], retained: [], bytes_freed: 0 }, null, 2),
       }],
     };
   }
@@ -1621,36 +1809,38 @@ function cleanupRuntime(args) {
   const removed = [];
   const retained = [];
   let bytesFreed = 0;
-  const entries = fs.readdirSync(workersDir, { withFileTypes: true })
-    .filter(entry => entry.isDirectory() && /^(pi|codex)-/.test(entry.name));
+  for (const workersDir of existingWorkersDirs) {
+    const entries = fs.readdirSync(workersDir, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && /^(pi|codex)-/.test(entry.name));
 
-  for (const entry of entries) {
-    const dir = path.join(workersDir, entry.name);
-    let stat;
-    try {
-      stat = fs.statSync(dir);
-    } catch {
-      continue;
-    }
-    const bytes = dirSizeBytes(dir);
-    const item = {
-      worker_id: entry.name,
-      path: dir,
-      mtime: stat.mtime.toISOString(),
-      bytes,
-    };
-    if (stat.mtimeMs < cutoff) {
-      removed.push(item);
-      bytesFreed += bytes;
-      if (!dry_run) removeWorkerRuntime(dir, workDir);
-    } else {
-      retained.push(item);
+    for (const entry of entries) {
+      const dir = path.join(workersDir, entry.name);
+      let stat;
+      try {
+        stat = fs.statSync(dir);
+      } catch {
+        continue;
+      }
+      const bytes = dirSizeBytes(dir);
+      const item = {
+        worker_id: entry.name,
+        path: dir,
+        mtime: stat.mtime.toISOString(),
+        bytes,
+      };
+      if (stat.mtimeMs < cutoff) {
+        removed.push(item);
+        bytesFreed += bytes;
+        if (!dry_run) removeWorkerRuntime(dir, workDir);
+      } else {
+        retained.push(item);
+      }
     }
   }
 
   const result = {
     runtime_dir: runtimeDir,
-    workers_dir: workersDir,
+    workers_dirs: existingWorkersDirs,
     retain_days: Number(retain_days),
     dry_run: Boolean(dry_run),
     removed,
@@ -1673,9 +1863,11 @@ function previewPrompt(args) {
     embed_context = true,
     trellis_context_id,
     validation_commands = [],
+    base = 'main',
   } = args;
   const workDir = cwd || process.cwd();
   const executionMode = executionModeInput || defaultExecutionMode(mode);
+  const reviewDiff = executionMode === 'review' ? captureReviewDiff(workDir, base) : null;
   let taskDir = explicitTaskDir || resolveActiveTask(workDir, trellis_context_id);
   if (!taskDir && mode !== 'custom' && !extra_instructions) {
     return { content: [{ type: 'text', text: 'No active Trellis task found. Provide task_dir, trellis_context_id, use custom mode, or provide extra_instructions for standalone preview.' }], isError: true };
@@ -1684,9 +1876,9 @@ function previewPrompt(args) {
   let body;
   if (taskDir) {
     const context = assembleTrellisContext(workDir, taskDir, mode);
-    body = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands, context_files: readContextFiles(workDir, context_files), embed_context });
+    body = buildDispatchPrompt({ ...context, mode, execution_mode: executionMode, extra_instructions, scope, validation_commands, context_files: readContextFiles(workDir, context_files), embed_context, reviewDiff });
   } else {
-    body = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode, readContextFiles(workDir, context_files));
+    body = buildNoTrellisPrompt(mode, extra_instructions, scope, validation_commands, executionMode, readContextFiles(workDir, context_files), reviewDiff);
   }
   return { content: [{ type: 'text', text: body }] };
 }
@@ -1703,14 +1895,14 @@ const TOOLS = [
         mode: { type: 'string', enum: ['implement', 'check', 'custom'], default: 'implement' },
         task_dir: { type: 'string', description: 'Explicit Trellis task directory (relative to repo root). Omit to auto-resolve.' },
         working_directory: { type: 'string', description: 'Repo root. Defaults to cwd.' },
-        executor: { type: 'string', enum: ['pi', 'codex'], description: 'Executor backend. Defaults: [pi_adapter] default_executor in ~/.pi/config.toml, else implement/custom→codex, check→pi.' },
-        model: { type: 'string', description: 'Logical name (implementer / reviewer / custom key from ~/.pi/config.toml [pi_adapter], or [pi_adapter.codex] for codex) or a fully qualified route/model name. Omit to use the default for the mode (codex falls back to the codex CLI default model).' },
-        thinking: { type: 'string', default: 'high' },
+        executor: { type: 'string', enum: ['pi', 'codex'], description: 'Executor backend. Defaults: [executor_adapter] default_executor in ~/.pi/config.toml, else implement/custom→codex, check→pi.' },
+        model: { type: 'string', description: 'Logical name (implementer / reviewer / custom key from ~/.pi/config.toml [executor_adapter], or [executor_adapter.codex] for codex) or a fully qualified route/model name. Omit to use the default for the mode (codex falls back to the codex CLI default model). For the Codex backend, use executor="codex"; do not pass model="codex".' },
+        thinking: { type: 'string', default: 'xhigh' },
         execution_mode: { type: 'string', enum: ['review', 'patch', 'worktree', 'direct'], description: 'review=read-only report, patch=final-answer diff, worktree=isolated git worktree + exported diff.patch, direct=legacy in-place execution. Defaults to worktree for implement/custom and review for check.' },
-        isolate_executor: { type: 'boolean', default: true, description: 'Preferred isolation flag. When true, Pi gets --no-extensions/--no-skills/etc. plus a per-worker PI_CODING_AGENT_DIR; codex gets --ignore-user-config --ignore-rules --ephemeral.' },
-        isolate_pi: { type: 'boolean', default: true, description: 'Compatibility name for executor isolation. When true, Pi gets --no-extensions/--no-skills/etc. plus a per-worker PI_CODING_AGENT_DIR; codex gets --ignore-user-config --ignore-rules --ephemeral.' },
+        isolate_executor: { type: 'boolean', default: true, description: 'Preferred isolation flag. When true, Pi gets --no-extensions/--no-skills/etc. plus a per-worker PI_CODING_AGENT_DIR; codex gets --ignore-rules --ephemeral while still loading user config for provider/auth settings.' },
+        isolate_pi: { type: 'boolean', default: true, description: 'Compatibility name for executor isolation. When true, Pi gets --no-extensions/--no-skills/etc. plus a per-worker PI_CODING_AGENT_DIR; codex gets --ignore-rules --ephemeral while still loading user config for provider/auth settings.' },
         embed_context: { type: 'boolean', default: true, description: 'When false, Trellis manifest/task artifact contents are not inlined under Embedded Trellis Context; only paths are listed for the executor to read on demand.' },
-        tools: { type: 'string', description: 'Comma-separated Pi tools (pi executor only; codex uses --sandbox mapped from execution_mode). Defaults by execution_mode: review=read,grep,find,ls; patch=read,bash,grep,find,ls; worktree/direct=read,bash,edit,write,grep,find,ls.' },
+        tools: { type: 'string', description: 'Comma-separated Pi tools (pi executor only; codex uses --sandbox mapped from execution_mode). Defaults by execution_mode: review=read,bash,grep,find,ls; patch=read,bash,grep,find,ls; worktree/direct=read,bash,edit,write,grep,find,ls.' },
         timeout_minutes: { type: 'number', default: 60, description: 'Capped at 120.' },
         dry_run: { type: 'boolean', default: false, description: 'Build prompt without launching the executor.' },
         extra_instructions: { type: 'string' },
@@ -1723,6 +1915,7 @@ const TOOLS = [
         required_paths_modified: { type: 'array', items: { type: 'string' }, description: 'Fail if any path NOT in the diff.' },
         forbidden_paths: { type: 'array', items: { type: 'string' }, description: 'Fail if any path IS in the diff. Trailing / matches directory prefix.' },
         min_diff_lines: { type: 'number', description: 'Fail if total ins+del < N.' },
+        base: { type: 'string', default: 'main', description: 'Review-only: git ref to diff the working tree against. The adapter embeds `git diff --stat <base>` plus a truncated diff into the review prompt so the reviewer need not guess the changes. Defaults to "main"; pass e.g. "origin/main" or a sha. Silently skipped when the ref is absent or the dir is not a git repo.' },
       },
     },
   },
@@ -1742,6 +1935,7 @@ const TOOLS = [
         embed_context: { type: 'boolean', default: true },
         trellis_context_id: { type: 'string' },
         validation_commands: { type: 'array', items: { type: 'string' } },
+        base: { type: 'string', default: 'main', description: 'Review-only git ref diffed into the prompt (see dispatch).' },
       },
     },
   },
@@ -1751,9 +1945,9 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        model: { type: 'string', description: 'Logical name or fully qualified route/model name.' },
+        model: { type: 'string', description: 'Logical name or fully qualified route/model name. For the Codex backend, use executor="codex"; do not pass model="codex".' },
         mode: { type: 'string', enum: ['implement', 'check'], default: 'implement', description: 'Default logical key to resolve when model is omitted.' },
-        executor: { type: 'string', enum: ['pi', 'codex'], description: 'Executor backend. Defaults: [pi_adapter] default_executor, else implement→codex, check→pi.' },
+        executor: { type: 'string', enum: ['pi', 'codex'], description: 'Executor backend. Defaults: [executor_adapter] default_executor, else implement→codex, check→pi.' },
         working_directory: { type: 'string' },
       },
     },
@@ -1766,7 +1960,7 @@ const TOOLS = [
       properties: {
         log_file: { type: 'string', description: 'Path to executor output log. report.json is read from the same directory when present.' },
         report_file: { type: 'string', description: 'Path to report.json.' },
-        runtime_dir: { type: 'string', description: 'Runtime dir or worker dir. Supports .trellis/.runtime and standalone /tmp/pi-adapter layouts.' },
+        runtime_dir: { type: 'string', description: 'Runtime dir or worker dir. Supports .trellis/.runtime and standalone /tmp/executor-adapter layouts; legacy /tmp/pi-adapter is still readable.' },
         worker_id: { type: 'string', description: 'Worker id under <runtime_dir>/pi-workers/<worker-id>.' },
         lines: { type: 'number', default: 200 },
         working_directory: { type: 'string' },
@@ -1775,11 +1969,11 @@ const TOOLS = [
   },
   {
     name: 'cleanup_runtime',
-    description: 'Prune old executor worker runtime directories under .trellis/.runtime/pi-workers or /tmp/pi-adapter/pi-workers.',
+    description: 'Prune old executor worker runtime directories under .trellis/.runtime/pi-workers or /tmp/executor-adapter/pi-workers.',
     inputSchema: {
       type: 'object',
       properties: {
-        working_directory: { type: 'string', description: 'Repo root. Defaults to cwd. Trellis repos use .trellis/.runtime; standalone repos use /tmp/pi-adapter.' },
+        working_directory: { type: 'string', description: 'Repo root. Defaults to cwd. Trellis repos use .trellis/.runtime; standalone repos use /tmp/executor-adapter.' },
         retain_days: { type: 'number', default: 7, description: 'Remove worker directories older than this many days. Default 7.' },
         dry_run: { type: 'boolean', default: false, description: 'When true, only reports what would be removed.' },
       },

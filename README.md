@@ -1,22 +1,25 @@
-# pi-adapter
+# executor-adapter
 
-[![npm version](https://img.shields.io/npm/v/@galaxy9day/pi-adapter.svg)](https://www.npmjs.com/package/@galaxy9day/pi-adapter)
+[![npm version](https://img.shields.io/npm/v/@galaxy9day/executor-adapter.svg)](https://www.npmjs.com/package/@galaxy9day/executor-adapter)
 [![license](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](./LICENSE)
 
 A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that lets Claude Code / any MCP-aware orchestrator dispatch coding tasks to an executor backend: the **OpenAI Codex CLI** (`codex exec`) or the **Pi coding agent** (`pi` CLI).
 
 When Trellis is present, this MCP reads Trellis task artifacts and can optionally emit **non-invasive Trellis channel audit messages**. It does **not** register as a native Trellis channel provider/worker. Outside Trellis, it falls back to a standalone subprocess path with its own lock + auto-validation.
 
+Recommended: Trellis ≥ 0.6.0 (tested against 0.6.9). Channel audit messages require `@mindfoldhq/trellis-core` 0.6.x; without it the adapter degrades to the `trellis channel send` CLI, then drops the event. This MCP complements — never replaces — Trellis native channel workers or the built-in Pi extension.
+
 ---
 
 ## What it does
 
 - Reads Trellis task artifacts (`prd.md`, `design.md`, `implement.md`, `implement.jsonl` / `check.jsonl`) and assembles an executor-ready prompt.
+- Embeds Trellis context within a per-file (32 KiB) and total (128 KiB) budget mirroring Trellis 0.6.x sub-agent context caps; over-budget files are truncated to a leading summary and later files list their path only (`embed_context=false` skips inlining entirely).
 - Defaults implementation/custom dispatches to **Codex CLI** in an isolated git worktree under `.trellis/.runtime/pi-workers/<worker-id>/`, then exports `diff.patch` and `report.json` for the orchestrator to review/apply.
 - Keeps **Pi** available as an opt-in provider-routing backend for cross-model review or non-OpenAI implementation experiments.
 - Spawns the selected executor with a sanitised environment (credential-shaped vars are stripped before inheritance).
 - Classifies patch-ready limited-validation runs distinctly from true blockers, so orchestrators can continue main-repo validation without reading the full executor log.
-- Defaults adapter `check` dispatches to read-only Pi review mode (`read,grep,find,ls`) so Pi can supplement quality review without mutating the repo.
+- Defaults adapter `check` dispatches to read-only Pi review mode (`read,bash,grep,find,ls`) so Pi can supplement quality review without mutating the repo.
 - In channel mode: emits best-effort bookend audit messages into the Trellis channel via `@mindfoldhq/trellis-core`'s `sendMessage`.
 - Runs post-execution validation against `git diff` (`min_files_changed`, `required_paths_modified`, `forbidden_paths`, `min_diff_lines`) — catches "exit 0 + no useful work" failures before the orchestrator sees them.
 - Resolves executor model names from `~/.pi/config.toml` so you never hard-code provider routes into scripts.
@@ -29,10 +32,10 @@ When Trellis is present, this MCP reads Trellis task artifacts and can optionall
 // ~/.claude.json
 {
   "mcpServers": {
-    "pi-adapter": {
+    "executor-adapter": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@galaxy9day/pi-adapter@latest"]
+      "args": ["-y", "@galaxy9day/executor-adapter@latest"]
     }
   }
 }
@@ -43,36 +46,52 @@ That's it — `npx` fetches the latest version on each invocation; no `npm insta
 ### Globally (optional)
 
 ```bash
-npm install -g @galaxy9day/pi-adapter
+npm install -g @galaxy9day/executor-adapter
 ```
 
-Then `"command": "pi-adapter"` in your MCP config (no args needed).
+Then `"command": "executor-adapter"` in your MCP config (no args needed).
+
+### Migration from `pi-adapter`
+
+`executor-adapter` is the long-term package, binary, MCP server key, and skill
+name. The old `@galaxy9day/pi-adapter` package can remain installed for
+existing machines that still use the `pi-adapter` MCP server key, but new MCP
+configs should use the `executor-adapter` server key so tool names are
+`mcp__executor-adapter__dispatch`, `mcp__executor-adapter__smoke`, and so on.
+
+For multi-device use, configure Codex independently on each machine. The Codex
+executor reads that machine's `$CODEX_HOME/config.toml` and `$CODEX_HOME/auth.json`;
+the adapter does not forward `OPENAI_API_KEY`, `CODEX_API_KEY`, or other API-key
+environment variables into the subprocess.
 
 ## Configure
 
 `~/.pi/config.toml`:
 
 ```toml
-[pi_adapter]
+[executor_adapter]
 implementer = "newapi/gpt-5.5"           # pi executor, mode=implement|custom
 reviewer    = "anthropic/claude-opus-4-7" # pi executor, mode=check / cross-model review
 # default_executor = "codex"             # optional: override the built-in routing for all calls
 # Add any custom logical name you want, e.g.:
 # fast        = "newapi/gpt-5-mini"
 
-[pi_adapter.codex]
-implementer = "gpt-5.5-codex"            # optional; omit the section to use the codex CLI default model
+[executor_adapter.codex]
+implementer = "gpt-5.5"                  # optional; omit the section to use the codex CLI default model
 reviewer    = "gpt-5.5"
 ```
 
-Without this config, pi-executor calls without a fully-qualified `model` parameter throw a friendly error pointing you here. The codex executor never requires config: with no `[pi_adapter.codex]` entry and no `model` parameter it omits `-m` and uses the codex CLI's own configured default model.
+Without this config, pi-executor calls without a fully-qualified `model` parameter throw a friendly error pointing you here. The codex executor never requires config: with no `[executor_adapter.codex]` entry and no `model` parameter it omits `-m` and uses the codex CLI's own configured default model.
 
-You can also pass a fully-qualified Pi route (or codex model name) directly per call:
+You can also pass a fully-qualified Pi route or exact Codex model id directly per call:
 
 ```
 dispatch(model="anthropic/claude-opus-4-7", executor="pi", ...)
-dispatch(model="gpt-5.5-codex", executor="codex", ...)
+dispatch(executor="codex", ...)                  # use this machine's Codex default
+dispatch(model="gpt-5.5", executor="codex", ...) # explicit Codex model id
 ```
+
+Do not pass `model="codex"`: `codex` is the executor backend name, not a model.
 
 ## Executors
 
@@ -81,17 +100,17 @@ Two backends share the same dispatch pipeline (worktree isolation, diff export, 
 | | `pi` | `codex` |
 |---|---|---|
 | Binary | `pi` (`PI_BINARY` override) | `codex` (`CODEX_BINARY` override) |
-| Model source | `[pi_adapter]` logical names or full route | `[pi_adapter.codex]`, explicit `model`, or the codex CLI default |
-| Isolation (`isolate_executor=true`) | per-worker `PI_CODING_AGENT_DIR` + `--no-extensions/--no-skills/...` | `--ignore-user-config --ignore-rules --ephemeral` |
+| Model source | `[executor_adapter]` logical names or full route | `[executor_adapter.codex]`, explicit `model`, or the codex CLI default |
+| Isolation (`isolate_executor=true`) | per-worker `PI_CODING_AGENT_DIR` + `--no-extensions/--no-skills/...` | `--ignore-rules --ephemeral`; user config is still loaded for provider/auth settings |
 | Tool restriction | `--tools` list from the `tools` param | OS sandbox: `--sandbox read-only` (review/patch) or `workspace-write` (worktree/direct) |
-| Auth | `PI_*` / `NEWAPI_*` env preserved | `~/.codex/auth.json` (run `codex login` once); API keys are never forwarded |
+| Auth | `PI_*` / `NEWAPI_*` env preserved | local `$CODEX_HOME/config.toml` + `$CODEX_HOME/auth.json`; API keys are never forwarded |
 | Output | plain text log | `--json` JSONL events; token `usage` lands in report.json |
 
-Routing: explicit `executor` param > `default_executor` in `[pi_adapter]` > built-in default — **implement/custom → codex** (native GPT harness + OS sandbox), **check → pi** (cross-model review via Pi's provider routing). A missing binary is a hard error with a hint, never a silent fallback.
+Routing: explicit `executor` param > `default_executor` in `[executor_adapter]` > built-in default — **implement/custom → codex** (native GPT harness + OS sandbox), **check → pi** (cross-model review via Pi's provider routing). A missing binary is a hard error with a hint, never a silent fallback.
 
 ## Tools
 
-This server exposes 5 MCP tools (namespace `pi-adapter`):
+This server exposes 5 MCP tools (namespace `executor-adapter`):
 
 ### `dispatch(...)`
 
@@ -103,12 +122,12 @@ Assemble context, run the selected executor, optionally emit channel events, run
 | `task_dir` | string | Trellis task directory (relative to repo). Omit to auto-resolve via `task.py current`. |
 | `working_directory` | string | Repo root; defaults to CWD. |
 | `executor` | `pi` \| `codex` | Executor backend. Defaults: `default_executor` config, else `implement/custom→codex`, `check→pi`. |
-| `model` | string | Logical name (`implementer` / `reviewer` / custom key; `[pi_adapter.codex]` for codex) or fully qualified route/model name. |
-| `thinking` | string | Reasoning effort. Default `high` (`--thinking` for pi, `model_reasoning_effort` for codex). |
+| `model` | string | Logical name (`implementer` / `reviewer` / custom key; `[executor_adapter.codex]` for codex) or fully qualified route/model name. For Codex, omit it to use `$CODEX_HOME/config.toml`; never use `model="codex"`. |
+| `thinking` | string | Reasoning effort. Default `xhigh` (`--thinking` for pi, `model_reasoning_effort` for codex). |
 | `execution_mode` | string | `review`, `patch`, `worktree`, or `direct`. Defaults to `worktree` for `implement/custom`, `review` for `check`. |
-| `isolate_executor` / `isolate_pi` | boolean | Default `true`. `isolate_executor` is the preferred name; `isolate_pi` remains as a compatibility alias. Pi: disables extensions/skills/prompt templates/context files/session persistence and uses a per-worker Pi home. Codex: `--ignore-user-config --ignore-rules --ephemeral`. |
+| `isolate_executor` / `isolate_pi` | boolean | Default `true`. `isolate_executor` is the preferred name; `isolate_pi` remains as a compatibility alias. Pi: disables extensions/skills/prompt templates/context files/session persistence and uses a per-worker Pi home. Codex: `--ignore-rules --ephemeral` while still loading user config for provider/auth settings. |
 | `embed_context` | boolean | Default `true`: inline Trellis manifest/task artifact contents. When `false`, only list paths for the executor to read on demand. |
-| `tools` | string | Comma-separated tool list (pi executor only; codex restricts via `--sandbox`). Defaults by `execution_mode`: `review=read,grep,find,ls`, `patch=read,bash,grep,find,ls`, `worktree/direct=read,bash,edit,write,grep,find,ls`. |
+| `tools` | string | Comma-separated tool list (pi executor only; codex restricts via `--sandbox`). Defaults by `execution_mode`: `review=read,bash,grep,find,ls`, `patch=read,bash,grep,find,ls`, `worktree/direct=read,bash,edit,write,grep,find,ls`. |
 | `timeout_minutes` | number | Default 60, hard-capped at 120. |
 | `dry_run` | boolean | Build prompt without launching the executor. |
 | `extra_instructions` | string | Additional prompt text appended after assembled context. |
@@ -121,11 +140,12 @@ Assemble context, run the selected executor, optionally emit channel events, run
 | `required_paths_modified` | string[] | Post-validation: fail if any listed path NOT in diff. |
 | `forbidden_paths` | string[] | Post-validation: fail if any listed path IS in diff (trailing `/` matches dir prefix). |
 | `min_diff_lines` | number | Post-validation: fail if total ins+del < N. |
+| `base` | string | Review-only: git ref diffed into the prompt. Defaults to `main`. The adapter runs `git diff --stat <base>` plus a truncated `git diff <base>` and embeds them under "Changes under review" so the reviewer need not guess the diff. Silently skipped when the ref is absent or the dir is not a git repo. |
 
 #### Execution modes
 
 - `worktree` (default for implementation): creates `.trellis/.runtime/pi-workers/<worker-id>/repo` from `HEAD`, runs the executor there, writes `output.log`, `report.json`, and `diff.patch`, and returns an `apply_command` (`git apply "<patch>"`). The main repository is not modified by the executor.
-- `review` (default for check): runs read-only and reports findings. Codex uses `--sandbox read-only`; Pi uses `read,grep,find,ls`. Use this for cross-model review.
+- `review` (default for check): runs read-only and reports findings. Codex uses `--sandbox read-only`; Pi uses `read,bash,grep,find,ls` (the prompt restricts bash to read-only use — no writes/staging/commits/push). The adapter also embeds `git diff <base>` into the prompt and copies the executor's verdict into `report.json` as `review_summary`. Use this for cross-model review.
 - `patch`: asks the executor to produce a unified diff in its final answer without direct edits.
 - `direct`: legacy in-place execution in the target repository. Use only when the orchestrator explicitly wants executor writes in the main repo and the environment supports it.
 
@@ -165,6 +185,8 @@ Assemble context, run the selected executor, optionally emit channel events, run
 
 `blocked` is reserved for runs where the executor cannot continue and no apply-ready patch is available. When the executor exits 0 with a non-empty patch and post-validation passes, but isolated worktree data validation is unavailable, the adapter returns `patch_ready_limited_validation` instead of `blocked`.
 
+In `review` mode the result is classified independently of patch/worktree post-conditions: exit 0 yields `status: "done"` / `result_class: "review_completed"` / `status_reason: "Read-only review finished successfully."`, regardless of wording in the report — so normal review prose like "cannot / approval / required" is no longer misread as a blocker. `changed_files`, `min_diff_lines`, `required_paths_modified`, `forbidden_paths`, and `usablePatch` are not applied to review runs, and `data_validation` is `not_applicable`. The executor's verdict is also written to `report.json` as `review_summary` (tail of the captured output, capped at 4000 chars) so callers can read it without paging through `output.log`; `read_report` prints its first 800 chars. Review `orchestrator_next_steps` point at the findings and an optional follow-up implement dispatch, never at patch apply or full validation.
+
 The dispatch response intentionally does not inline long stdout/stderr. It returns summary fields and artifact paths; use `read_report` when you need the log tail.
 
 `project_mode` is one of `trellis_channel_bridge`, `trellis_local_worktree`, `standalone_worktree`, or `standalone`.
@@ -175,15 +197,15 @@ Same args as `dispatch` (subset). Renders the prompt without launching an execut
 
 ### `smoke({ model?, mode?, executor? })`
 
-One-shot connectivity test. Verifies the executor binary is on PATH and the resolved model answers a trivial round-trip. `model` accepts either a logical name or a fully qualified route/model name, `mode` (`implement` or `check`) chooses the default logical key when `model` is omitted, and `executor` follows the same routing defaults as `dispatch`. On failure it prints separate stdout and stderr blocks, the resolved model, safe env values, and (pi) the config files copied into the isolated Pi home.
+One-shot connectivity test. Verifies the executor binary is on PATH and the resolved model answers a trivial round-trip. `model` accepts either a logical name or a fully qualified route/model name, `mode` (`implement` or `check`) chooses the default logical key when `model` is omitted, and `executor` follows the same routing defaults as `dispatch`. For Codex, `model="codex"` is rejected for the same reason as `dispatch`. On failure it prints separate stdout and stderr blocks, the resolved model, safe env values, and (pi) the config files copied into the isolated Pi home.
 
 ### `read_report({ log_file?, report_file?, runtime_dir?, worker_id?, lines? })`
 
-Reads `report.json` when available and prints a short summary first: `result_class`, `project_mode`, `changed_files`, `apply_command`, next steps, and recommended commands. It can resolve both Trellis runtime directories (`.trellis/.runtime/pi-workers/<worker-id>/`) and standalone runtime directories (`/tmp/pi-adapter/pi-workers/<worker-id>/`). Log tail output remains available via `lines`.
+Reads `report.json` when available and prints a short summary first: `result_class`, `project_mode`, `changed_files`, `apply_command`, next steps, and recommended commands. It can resolve both Trellis runtime directories (`.trellis/.runtime/pi-workers/<worker-id>/`) and standalone runtime directories (`/tmp/executor-adapter/pi-workers/<worker-id>/`). Log tail output remains available via `lines`.
 
 ### `cleanup_runtime({ working_directory?, retain_days?, dry_run? })`
 
-Prunes old `pi-*` / `codex-*` worker directories from the adapter runtime (`.trellis/.runtime/pi-workers/` in Trellis repos, `/tmp/pi-adapter/pi-workers/` otherwise). It reports removed/retained worker dirs and freed bytes. Use `dry_run=true` before deleting.
+Prunes old `pi-*` / `codex-*` worker directories from the adapter runtime (`.trellis/.runtime/pi-workers/` in Trellis repos, `/tmp/executor-adapter/pi-workers/` otherwise). It reports removed/retained worker dirs and freed bytes. Use `dry_run=true` before deleting.
 
 ## Channel mode
 
@@ -191,11 +213,13 @@ When `dispatch` detects `TRELLIS_CHANNEL` / `TRELLIS_CHANNEL_NAME` env var (or a
 
 1. **Keeps its own local dispatch lock.** A channel message does not make the executor a native Trellis worker; Trellis `worker_guard` does not own this subprocess lifecycle.
 2. **Emits bookend audit messages** via `@mindfoldhq/trellis-core/channel`'s `sendMessage`:
-   - text `pi-adapter: dispatch_start` when Pi spawns
-   - text `pi-adapter: dispatch_done` / `dispatch_failed` / `spawn_error` on exit
-   - structured `meta` includes `schema: "pi-adapter.dispatch.v1"`, exit code, validation status, changed files, report/log/patch paths
-3. **Three-tier fallback**: if `@mindfoldhq/trellis-core` is unavailable, falls back to official `trellis channel send --as pi-adapter --stdin` CLI shape (async); if that's also missing, drops the event with a stderr note. Dispatch never blocks on channel emission.
-4. **Local log still written** at `.trellis/.runtime/pi-workers/<worker-id>/output.log` (or `/tmp/pi-adapter/...`) for debugging.
+   - text `executor-adapter: dispatch_start` when the executor spawns
+   - text `executor-adapter: dispatch_done` / `dispatch_failed` / `spawn_error` on exit
+   - structured `meta` includes `schema: "executor-adapter.dispatch.v1"`, `event` (the bookend name — trellis-core 0.6.x dropped the `tag` option), exit code, validation status, changed files, report/log/patch paths
+   - a stable `idempotencyKey` (`executor-adapter:<worker_id>:<event>`) so retries don't double-append — trellis-core 0.6.x `appendEvent` dedups on `idempotencyKey` + `kind`
+   - `task` is sent as a workDir-relative path (resolved from absolute / symlinked task dirs) so a channel reader on another checkout can locate it
+3. **Three-tier fallback**: if `@mindfoldhq/trellis-core` is unavailable, falls back to official `trellis channel send --as executor-adapter --stdin` CLI shape (async); if that's also missing, drops the event with a stderr note. Dispatch never blocks on channel emission.
+4. **Local log still written** at `.trellis/.runtime/pi-workers/<worker-id>/output.log` (or `/tmp/executor-adapter/...`) for debugging.
 
 Codex `--json` events are parsed into the local report, but channel mode still emits only dispatch bookends for a stable Trellis audit surface. Pi stdout is plain text, so it is not streamed into per-message channel events. These audit messages are normal Trellis `message` events, not native `spawned` / `done` / `killed` worker lifecycle events. Read the MCP result, `report.json`, `output.log`, or use `read_report` for the authoritative result.
 
@@ -205,12 +229,19 @@ When `.trellis/` isn't present, the main orchestrator agent (Claude Code / Codex
 
 - The skill exposes its tools; the orchestrator decides when to call them
 - `dispatch` requires `extra_instructions` in `custom` mode
-- Runtime files go to `/tmp/pi-adapter/pi-workers/<worker-id>/` instead of `.trellis/.runtime/pi-workers/<worker-id>/`
+- Runtime files go to `/tmp/executor-adapter/pi-workers/<worker-id>/` instead of `.trellis/.runtime/pi-workers/<worker-id>/`
 - A fingerprint lock keyed on `(scope, extra_instructions)` prevents accidental concurrent identical dispatches
 
-## Trellis sub-agent templates
+## Trellis 0.6 custom agents and skills
 
-This package ships ready-to-copy Claude Code / Trellis custom agent templates in `templates/claude/agents/`:
+Trellis 0.6.x has two extension points that matter here:
+
+- **Custom sub-agents** (`.trellis/agents/*.md` for channel runtime, or platform-specific agent files such as `.claude/agents/*.md`) isolate a role/prompt and can be spawned by the orchestrator.
+- **Custom skills** (`*/skills/<name>/SKILL.md`) are auto-triggered workflow modules. They are the right place for usage policy, but not a replacement for the MCP server itself.
+
+`executor-adapter` remains an MCP server. It is not a native Trellis channel provider, and it does not install or mutate `.trellis/agents` files. Trellis native channel workers should continue to use `.trellis/agents/implement.md` / `check.md` or your own channel agents. Use the templates below when you want a Claude Code sub-agent to call the MCP and summarize the executor result, keeping long dispatch output out of the main context.
+
+This package ships ready-to-copy Claude Code custom agent templates in `templates/claude/agents/`:
 
 ```bash
 cp templates/claude/agents/*.md <your-project>/.claude/agents/
@@ -226,13 +257,14 @@ Task(subagent_type="trellis-pi-check")
 
 This keeps long dispatch output out of the main context. The sub-agent receives the MCP result, reads reports only when needed, and returns a short summary to the orchestrator.
 
-Use `trellis-codex-implement` for the normal GPT implementation path. Use `trellis-pi-implement` only when you explicitly want Pi provider routing for implementation, and `trellis-pi-check` for read-only cross-model review. The templates omit `model`, so the sub-agent inherits the Claude Code session model.
+Use `trellis-codex-implement` for the normal GPT implementation path. Use `trellis-pi-implement` only when you explicitly want Pi provider routing for implementation, and `trellis-pi-check` for read-only cross-model review. The templates set `effort: xhigh` for the Claude Code sub-agent itself; the MCP `thinking` parameter separately defaults to `xhigh` for the Codex/Pi executor it launches. The Codex template omits `model` so `codex exec` uses this machine's Codex default from `$CODEX_HOME/config.toml`; the Pi templates resolve logical routes from `~/.pi/config.toml`.
 
-No Trellis `inject-subagent-context` hook edit is required. `dispatch` assembles Trellis task context itself from the task artifacts (`prd.md`, `design.md`, `implement.md`, `implement.jsonl`, and `check.jsonl` where applicable).
+No Trellis `inject-subagent-context` hook edit is required. `dispatch` assembles Trellis task context itself from the task artifacts (`prd.md`, `design.md`, `implement.md`, `implement.jsonl`, and `check.jsonl` where applicable). For Codex/Pi/other platforms, translate these templates to the platform's native custom-agent syntax; do not put MCP tool names in `.trellis/agents/*.md`, because those files are provider-level channel runtime prompts, not MCP-capability declarations.
 
-See the Trellis custom agents docs: https://docs.trytrellis.app/advanced/custom-agents
+See the Trellis docs:
 
-These files follow the Claude Code agent format. Users on other platforms (Cursor, OpenCode, Codex, or similar) should translate the frontmatter and tool declarations to their platform's native agent syntax.
+- Custom agents: https://docs.trytrellis.app/advanced/custom-agents
+- Custom skills: https://docs.trytrellis.app/advanced/custom-skills
 
 ## Forward compatibility
 
@@ -240,7 +272,7 @@ Designed to keep working through Trellis version upgrades:
 
 - `@mindfoldhq/trellis-core/channel` is loaded via dynamic `import()` in `try/catch` — a missing or breaking-changed package degrades to CLI fallback, not module-load failure.
 - Two env var aliases (`TRELLIS_CHANNEL`, `TRELLIS_CHANNEL_NAME`) are checked, so a future Trellis rename keeps working.
-- `[trellis_pi_adapter]` TOML section is read as a legacy alias for `[pi_adapter]` (with a one-shot stderr nudge to migrate).
+- `[pi_adapter]` and `[trellis_pi_adapter]` TOML sections are read as legacy aliases for `[executor_adapter]` (with a one-shot stderr nudge to migrate).
 - No hard-coded paths — runtime dir resolves per-OS via `os.tmpdir()`; binaries can be overridden via `PI_BINARY` / `CODEX_BINARY` env.
 
 ## Environment
@@ -254,7 +286,7 @@ ANTHROPIC_*, OPENAI_*, CLAUDE_*, CCG_*,
 AWS_(ACCESS|SECRET)_*, GH_TOKEN, GITHUB_TOKEN, OP_*, DOCKER_PASS*
 ```
 
-Preserved: `PI_*`, `NEWAPI_*` (so Pi authenticates with its own provider) for the pi executor; `CODEX_HOME` and `CODEX_SQLITE_HOME` for the codex executor. Codex normally authenticates from `~/.codex/auth.json` (`codex login`). `CODEX_API_KEY`, `OPENAI_API_KEY`, and other API keys are not forwarded to executor subprocesses.
+Preserved: `PI_*`, `NEWAPI_*` (so Pi authenticates with its own provider) for the pi executor; `CODEX_HOME` and `CODEX_SQLITE_HOME` for the codex executor. By default, each machine uses its own Codex provider/auth state from `$CODEX_HOME/config.toml` and `$CODEX_HOME/auth.json` (`codex login`). `CODEX_API_KEY`, `OPENAI_API_KEY`, and other API keys are not forwarded to executor subprocesses, which keeps multi-device setups local to each host instead of depending on a synchronized key.
 
 The metaResponse line `Env: scrubbed N sensitive vars` confirms scrubbing fired. If an executor reports auth errors, the credential probably lives under a different prefix or the executor home does not contain the expected login state.
 
@@ -276,7 +308,7 @@ Do not start expensive full validation before independent check work that may mo
 
 For data-dependent worktree dispatches, pass stable schema or small sample artifacts through `context_files` when the executor needs facts that are not committed. Isolated worktrees do not include gitignored, generated, or uncommitted derived data.
 
-The full dispatch/verification protocol is documented in the pi-adapter skill (see the [project repository](https://github.com/Galaxy9day/pi-adapter), used together with the matching [coworkers](https://github.com/Galaxy9day/coworkers) skill).
+The full dispatch/verification protocol is documented in the executor-adapter skill (see the [project repository](https://github.com/Galaxy9day/executor-adapter), used together with the matching [coworkers](https://github.com/Galaxy9day/coworkers) skill).
 
 ## Compatibility
 
@@ -285,7 +317,7 @@ The full dispatch/verification protocol is documented in the pi-adapter skill (s
 | Node | 20 |
 | `pi` CLI (pi executor) | any recent version, on PATH |
 | `codex` CLI (codex executor) | any version with `codex exec --json` (2025+), on PATH, logged in via `codex login` |
-| Trellis (for channel mode) | `0.6.0-beta.10+` |
+| Trellis (for channel mode) | `0.6.0+` (`0.6.2` tested) |
 | Trellis (for spec assembly) | any 0.5+ |
 
 ## License
@@ -294,4 +326,4 @@ The full dispatch/verification protocol is documented in the pi-adapter skill (s
 
 ## Issues & contributions
 
-[GitHub Issues](https://github.com/Galaxy9day/pi-adapter/issues) for bugs and feature requests.
+[GitHub Issues](https://github.com/Galaxy9day/executor-adapter/issues) for bugs and feature requests.

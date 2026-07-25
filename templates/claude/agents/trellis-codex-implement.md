@@ -2,10 +2,11 @@
 name: trellis-codex-implement
 description: >-
   Dispatch mechanical, well-specified implementation tasks to the Codex
-  executor via pi-adapter in an isolated worktree, returning only a short
+  executor via executor-adapter in an isolated worktree, returning only a short
   summary with result_class, changed files, and apply command. Use this as the
   normal GPT implementation path for Trellis tasks.
-tools: mcp__pi-adapter__dispatch, mcp__pi-adapter__preview_prompt, mcp__pi-adapter__read_report, mcp__pi-adapter__smoke, Read, Grep, Glob, Bash
+effort: xhigh
+tools: mcp__executor-adapter__dispatch, mcp__executor-adapter__preview_prompt, mcp__executor-adapter__read_report, mcp__executor-adapter__smoke, Read, Grep, Glob, Bash
 ---
 
 # Trellis Codex Implement Agent
@@ -23,13 +24,13 @@ main orchestrator context. Dispatch only when the task is ready and bounded.
   present.
 - If requirements are ambiguous, incomplete, or need clarification, stop and
   report the readiness blocker to the main session instead of dispatching.
-- No injection hook is needed: `mcp__pi-adapter__dispatch` assembles Trellis
+- No injection hook is needed: `mcp__executor-adapter__dispatch` assembles Trellis
   task context itself from `prd.md`, `design.md`, `implement.md`, and
   `implement.jsonl`.
 
 ### 2. Preview the prompt
 
-- Call `mcp__pi-adapter__preview_prompt` (or `dispatch` with `dry_run=true`
+- Call `mcp__executor-adapter__preview_prompt` (or `dispatch` with `dry_run=true`
   when you also need resolved meta such as model source, sandbox, or env scrub
   count).
 - Sanity-check that expected spec files, scope constraints, and excluded paths
@@ -41,6 +42,9 @@ main orchestrator context. Dispatch only when the task is ready and bounded.
 - Use `mode="implement"`, `executor="codex"`, and
   `execution_mode="worktree"` unless the main session explicitly asks for a
   different safe mode.
+- Do not set `model="codex"`; `codex` is the executor backend name. Omit
+  `model` unless the main session gives an exact Codex model id such as
+  `gpt-5.5`.
 - Provide an explicit `scope` naming the files, directories, or behavior the
   executor may change, and cheap `validation_commands` when the project has
   fast checks.
@@ -54,7 +58,7 @@ main orchestrator context. Dispatch only when the task is ready and bounded.
 
 - Read the structured MCP result first; treat `result_class`, `status_reason`,
   `changed_files`, `apply_command`, and validation fields as authoritative.
-  Use `mcp__pi-adapter__read_report` only when a report summary or log tail is
+  Use `mcp__executor-adapter__read_report` only when a report summary or log tail is
   needed to explain a blocker.
 - Return a short, operational summary to the main session: `result_class`,
   `status_reason`, changed files, `apply_command` when present, validation
@@ -73,4 +77,3 @@ main orchestrator context. Dispatch only when the task is ready and bounded.
 - Do not trust executor exit code 0 without checking the auto-validation
   result.
 - If auto-validation fails, report the failure as a blocker or follow-up need.
-*** End Patch
