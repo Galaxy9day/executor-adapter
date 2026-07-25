@@ -1101,20 +1101,20 @@ async function dispatch(args) {
         error: { stage: 'worktree_setup', message: e.message },
         finished_at: new Date().toISOString(),
       };
-      writeJsonFile(reportPath, setupReport);
+      try { writeJsonFile(reportPath, setupReport); } catch (werr) { logErr(`writeReport failed: ${werr.message}`); }
       await emitChannelEvent(channelName, 'setup_failed', {
         mode, task: taskDir, executor,
         worker_id: workerId, execution_mode: executionMode,
         ok: false,
         run_status: 'setup_failed',
-        patch_status: setupReport.patch.status,
-        post_validation_status: setupReport.post_validation.status,
+        patch: setupReport.patch,
+        post_validation: setupReport.post_validation,
         error: setupReport.error,
         report_file: reportPath,
         finished_at: setupReport.finished_at,
       }, workDir);
       const message = `${metaResponse}\nError creating isolated git worktree: ${e.message}`;
-      return { content: [{ type: 'text', text: message }], isError: true };
+      return { content: [{ type: 'text', text: message }], isError: !setupReport.ok };
     }
   }
 
@@ -1195,7 +1195,12 @@ async function dispatch(args) {
       }
 
       const checkParams = { min_files_changed, required_paths_modified, forbidden_paths, min_diff_lines };
-      const rawValidation = runPostValidation(piWorkDir, checkParams);
+      // review never modifies files: skip runPostValidation entirely — it runs
+      // `git add -N` which would dirty the caller's git index. Feed a skipped
+      // result; buildPostValidation maps review -> {status:'skipped'} regardless.
+      const rawValidation = executionMode === 'review'
+        ? { skipped: true, failures: [], passed: true }
+        : runPostValidation(piWorkDir, checkParams);
 
       const stdout = stdoutBuf.snapshot();
       const stderr = stderrBuf.snapshot();
@@ -1245,18 +1250,18 @@ async function dispatch(args) {
         ...(executionMode === 'review' ? { review_summary: extractReviewSummary(output) } : {}),
         finished_at: new Date().toISOString(),
       };
-      writeJsonFile(reportPath, report);
+      try { writeJsonFile(reportPath, report); } catch (e) { logErr(`writeReport failed: ${e.message}`); }
 
       await emitChannelEvent(channelName, ok ? 'dispatch_done' : 'dispatch_failed', {
         mode, task: taskDir, executor,
         worker_id: workerId, execution_mode: executionMode,
         ok,
         run_status: runStatus,
-        patch_status: patch.status,
-        post_validation_status: postValidation.status,
+        patch,
+        post_validation: postValidation,
+        error,
         exit_code: exitCode, signal: signal || null,
         report_file: reportPath,
-        patch_file: patch.file,
         apply_command: applyCommand,
         finished_at: report.finished_at,
       }, workDir);
@@ -1339,21 +1344,21 @@ async function dispatch(args) {
         error: { stage: 'spawn', message: err.message },
         finished_at: new Date().toISOString(),
       };
-      writeJsonFile(reportPath, spawnReport);
+      try { writeJsonFile(reportPath, spawnReport); } catch (werr) { logErr(`writeReport failed: ${werr.message}`); }
       await emitChannelEvent(channelName, 'spawn_error', {
         mode, task: taskDir, executor,
         worker_id: workerId, execution_mode: executionMode,
         ok: false,
         run_status: 'spawn_error',
-        patch_status: spawnReport.patch.status,
-        post_validation_status: spawnReport.post_validation.status,
+        patch: spawnReport.patch,
+        post_validation: spawnReport.post_validation,
         error: spawnReport.error,
         report_file: reportPath,
         finished_at: spawnReport.finished_at,
       }, workDir);
       finish({
         content: [{ type: 'text', text: `${metaResponse}\nError spawning ${exec.name}: ${err.message}` }],
-        isError: true,
+        isError: !spawnReport.ok,
       });
     });
   });

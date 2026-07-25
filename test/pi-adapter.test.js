@@ -157,7 +157,7 @@ function assertV2Report(report) {
   assert.ok(!('has_patch' in report.patch), 'patch.has_patch must be removed (derived from status)');
   assert.ok(report.post_validation && typeof report.post_validation === 'object', 'post_validation object required');
   assert.ok(['passed', 'failed', 'skipped'].includes(report.post_validation.status), `bad post_validation.status: ${report.post_validation.status}`);
-  for (const gone of ['result_class', 'status', 'status_reason', 'validation_scope', 'data_validation', 'isolate_pi', 'killed', 'patch_file']) {
+  for (const gone of ['result_class', 'status', 'status_reason', 'validation_scope', 'data_validation', 'data_validation_reason', 'isolate_pi', 'killed', 'patch_file', 'orchestrator_next_steps', 'recommended_main_repo_commands', 'validation_failures', 'shortstat']) {
     assert.ok(!(gone in report), `v1 field ${gone} must be absent`);
   }
   assert.ok('error' in report, 'top-level error field required');
@@ -389,6 +389,30 @@ test('matrix 9 (integration): every report path carries schema, ok, structured e
     assert.equal(failResult.isError, !failReport.ok);
   } finally {
     failMcp.close();
+  }
+});
+
+test('review does not dirty the git index (skips runPostValidation / git add -N)', async () => {
+  const repo = makeRepo();
+  // An unstaged file: `git add -N` (inside runPostValidation) would surface it
+  // in `git status --porcelain`. review must skip runPostValidation entirely.
+  fs.writeFileSync(path.join(repo, 'unstaged.txt'), 'hi\n', 'utf-8');
+  const mcp = startMcp({ FAKE_CODEX_SCENARIO: 'none' });
+  try {
+    await mcp.init();
+    const before = runGit(repo, ['status', '--porcelain']).trim();
+    const result = await mcp.callTool('dispatch', {
+      mode: 'custom', executor: 'codex', execution_mode: 'review',
+      working_directory: repo, extra_instructions: 'review only',
+      min_files_changed: 1, forbidden_paths: ['x'], // would trigger git add -N if runPostValidation ran
+    });
+    const after = runGit(repo, ['status', '--porcelain']).trim();
+    assert.equal(after, before, `review dirtied git index (runPostValidation ran):\nbefore: ${before}\nafter: ${after}`);
+    const report = readReport(result);
+    assertV2Report(report);
+    assert.equal(report.post_validation.status, 'skipped');
+  } finally {
+    mcp.close();
   }
 });
 

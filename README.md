@@ -95,7 +95,7 @@ Do not pass `model="codex"`: `codex` is the executor backend name, not a model.
 
 ## Executors
 
-Two backends share the same dispatch pipeline (worktree isolation, diff export, post-validation, result classes, channel audit):
+Two backends share the same dispatch pipeline (worktree isolation, diff export, post-validation, v2 report model, channel audit):
 
 | | `pi` | `codex` |
 |---|---|---|
@@ -219,7 +219,7 @@ When `dispatch` detects `TRELLIS_CHANNEL` / `TRELLIS_CHANNEL_NAME` env var (or a
 2. **Emits bookend audit messages** via `@mindfoldhq/trellis-core/channel`'s `sendMessage`:
    - text `executor-adapter: dispatch_start` when the executor spawns
    - text `executor-adapter: dispatch_done` / `dispatch_failed` on exit; `setup_failed` / `spawn_error` for terminal pre-run failures
-   - structured `meta` includes `schema: "executor-adapter.dispatch.v2"`, `event` (the bookend name — trellis-core 0.6.x dropped the `tag` option), and the core v2 facts: `ok`, `run_status`, `patch_status`, `post_validation_status`, exit code, report/log/patch paths
+   - structured `meta` includes `schema: "executor-adapter.dispatch.v2"`, `event` (the bookend name — trellis-core 0.6.x dropped the `tag` option), and the core v2 facts: `ok`, `run_status`, the full `patch` and `post_validation` objects, `error`, exit code, report/log paths
    - a stable `idempotencyKey` (`executor-adapter:<worker_id>:<event>`) so retries don't double-append — trellis-core 0.6.x `appendEvent` dedups on `idempotencyKey` + `kind`
    - `task` is sent as a workDir-relative path (resolved from absolute / symlinked task dirs) so a channel reader on another checkout can locate it
 3. **Three-tier fallback**: if `@mindfoldhq/trellis-core` is unavailable, falls back to official `trellis channel send --as executor-adapter --stdin` CLI shape (async); if that's also missing, drops the event with a stderr note. Dispatch never blocks on channel emission.
@@ -321,7 +321,7 @@ The full dispatch/verification protocol is documented in the executor-adapter sk
 | Node | 20 |
 | `pi` CLI (pi executor) | any recent version, on PATH |
 | `codex` CLI (codex executor) | any version with `codex exec --json` (2025+), on PATH, logged in via `codex login` |
-| Trellis (for channel mode) | `0.6.0+` (`0.6.2` tested) |
+| Trellis (for channel mode) | `0.6.0+` (`0.6.9` tested) |
 | Trellis (for spec assembly) | any 0.5+ |
 
 ## License

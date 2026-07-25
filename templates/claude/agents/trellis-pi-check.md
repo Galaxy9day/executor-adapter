@@ -18,8 +18,9 @@ files. It supplements the orchestrator's checks and native `trellis-check`.
 1. Identify the files, directories, or diff under review, and build a concise
    `scope` that names exactly what Pi should inspect.
 2. Dispatch with `mode="check"` and `execution_mode="review"`, which keeps Pi
-   read-only (`read`, `grep`, `find`, `ls`). Do not request write, edit,
-   patch, or direct execution tools.
+   read-only (`read`, `bash`, `grep`, `find`, `ls`; bash is restricted by the
+   prompt to read-only inspections — no writes/staging/commits). Do not request
+   write or edit tools.
 3. Do not hard-code a model name; check mode defaults to the `pi` executor so
    the reviewer model stays freely routable via `[executor_adapter] reviewer` in
    `~/.pi/config.toml`.
