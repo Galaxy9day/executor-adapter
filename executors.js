@@ -5,7 +5,8 @@
  * environment, resolve models from ~/.pi/config.toml, build spawn argv,
  * and interpret subprocess output into the adapter's shared result model.
  * Everything downstream (worktree, diff export, post-validation,
- * result_class, channel events) is executor-agnostic and lives in index.js.
+ * v2 orthogonal report fields, channel events) is executor-agnostic and lives
+ * in index.js (with the pure v2 helpers in report-v2.js).
  */
 
 import TOML from '@iarna/toml';
@@ -45,22 +46,22 @@ export function loadAdapterConfig() {
   if (raw) {
     try {
       const parsed = TOML.parse(raw);
-      // Preferred section name + legacy aliases. New keys win when multiple
-      // sections exist.
-      const sections = [parsed.executor_adapter, parsed.pi_adapter, parsed.trellis_pi_adapter];
-      let legacyUsed = false;
-      for (const section of sections) {
-        if (!section || typeof section !== 'object' || Array.isArray(section)) continue;
+      // 0.11.0: legacy [pi_adapter] / [trellis_pi_adapter] sections are no
+      // longer read. Surface a migration error (not silent) so configs that
+      // still rely on the old names fail loudly instead of silently dropping
+      // model routes.
+      if (parsed.pi_adapter || parsed.trellis_pi_adapter) {
+        logErr('CONFIG ERROR: legacy [pi_adapter] / [trellis_pi_adapter] TOML section detected in ~/.pi/config.toml. These sections are no longer read (0.11.0 breaking change). Rename them to [executor_adapter].');
+      }
+      const section = parsed.executor_adapter;
+      if (section && typeof section === 'object' && !Array.isArray(section)) {
         for (const [k, v] of Object.entries(section)) {
           if (typeof v !== 'string') continue;
           if (k === 'default_executor') {
             if (config.defaultExecutor === null) config.defaultExecutor = v;
             continue;
           }
-          if (!(k in config.pi)) {
-            config.pi[k] = v;
-            if (section !== parsed.executor_adapter) legacyUsed = true;
-          }
+          if (!(k in config.pi)) config.pi[k] = v;
         }
         const codexSection = section.codex;
         if (codexSection && typeof codexSection === 'object' && !Array.isArray(codexSection)) {
@@ -69,9 +70,6 @@ export function loadAdapterConfig() {
             if (!(k in config.codex)) config.codex[k] = v;
           }
         }
-      }
-      if (legacyUsed) {
-        logErr('reading legacy [pi_adapter]/[trellis_pi_adapter] TOML section — rename to [executor_adapter] when convenient.');
       }
     } catch (e) {
       logErr(`TOML parse error in ${cfgPath}: ${e.message}`);
@@ -133,7 +131,7 @@ function scrubEnv(parentEnv, keepPattern) {
 }
 
 function codexSandbox(executionMode) {
-  return (executionMode === 'review' || executionMode === 'patch') ? 'read-only' : 'workspace-write';
+  return executionMode === 'review' ? 'read-only' : 'workspace-write';
 }
 
 // ---- Executor: pi ----
@@ -187,14 +185,15 @@ const pi = {
     };
   },
 
-  interpretOutput({ exitCode, killed, stdout, stderr }) {
+  // Note: `killed`/signal lifecycle (timeout vs killed) is owned by the
+  // dispatcher (index.js), not the interpreter. Here we only classify the
+  // exit-code / native-failure outcome.
+  interpretOutput({ exitCode, stdout, stderr }) {
     let output = '';
     if (String(stdout || '').trim()) output += stdout.trim();
     if (String(stderr || '').trim()) output += (output ? '\n\n--- stderr ---\n' : '') + stderr.trim();
-    let runStatus;
-    if (killed) runStatus = 'timeout';
-    else runStatus = exitCode === 0 ? 'done' : 'failed';
-    return { runStatus, output, usage: null };
+    const runStatus = exitCode === 0 ? 'done' : 'failed';
+    return { runStatus, output, usage: null, error: null };
   },
 
   failureHint(stderr, stdout) {
@@ -304,13 +303,14 @@ const codex = {
       } catch {}
     }
     let output = lastMessage;
-    if (errors.length > 0) output += (output ? '\n\n' : '') + errors.join('\n');
+    const nativeError = errors.length > 0 ? errors.join('\n') : null;
+    if (nativeError) output += (output ? '\n\n' : '') + nativeError;
     if (String(stderr || '').trim()) output += (output ? '\n\n--- stderr ---\n' : '') + stderr.trim();
-    let runStatus;
-    if (killed) runStatus = 'timeout';
-    else if (errors.length > 0 || exitCode !== 0) runStatus = 'failed';
-    else runStatus = 'done';
-    return { runStatus, output, usage };
+    // failed = non-zero exit OR executor-native structured failure (turn.failed /
+    // error events). The natural-language approvalBlocked heuristic is gone;
+    // native structured failures are still honored.
+    const runStatus = (errors.length > 0 || exitCode !== 0) ? 'failed' : 'done';
+    return { runStatus, output, usage, error: nativeError };
   },
 
   failureHint(stderr, stdout) {
@@ -322,7 +322,7 @@ const codex = {
       return 'Codex rejected the model name. Check the `-m` value or the [executor_adapter.codex] section in ~/.pi/config.toml; omit model to use the codex CLI default.';
     }
     if (/sandbox|seatbelt|landlock|permission denied/i.test(combined)) {
-      return 'The codex OS sandbox blocked an operation. Check whether the execution_mode→sandbox mapping (review/patch=read-only, worktree/direct=workspace-write) matches what the task needs.';
+      return 'The codex OS sandbox blocked an operation. Check whether the execution_mode→sandbox mapping (review=read-only, worktree/direct=workspace-write) matches what the task needs.';
     }
     return '';
   },

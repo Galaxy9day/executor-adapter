@@ -23,10 +23,12 @@ files. It supplements the orchestrator's checks and native `trellis-check`.
 3. Do not hard-code a model name; check mode defaults to the `pi` executor so
    the reviewer model stays freely routable via `[executor_adapter] reviewer` in
    `~/.pi/config.toml`.
-4. Use the structured dispatch result as the primary source. Call
-   `mcp__executor-adapter__read_report` only when more report detail or a log tail
-   is needed, and ignore noisy transcript detail unless it supports a
-   specific finding.
+4. Use the structured dispatch result as the primary source. The v2 report
+   carries `ok`, `run_status` (`done` for a completed review), `patch.status`
+   (`not_applicable` in review mode), and `review_summary` (the executor's
+   tail verdict). Call `mcp__executor-adapter__read_report` only when more
+   report detail or a log tail is needed, and ignore noisy transcript detail
+   unless it supports a specific finding.
 5. Report findings only, grouped by severity (`blocker`, `major`, `minor`,
    `nit`), with `file:line` references whenever Pi provides enough
    information. Prefer concrete, reproducible issues over speculative

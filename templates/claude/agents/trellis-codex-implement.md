@@ -3,7 +3,7 @@ name: trellis-codex-implement
 description: >-
   Dispatch mechanical, well-specified implementation tasks to the Codex
   executor via executor-adapter in an isolated worktree, returning only a short
-  summary with result_class, changed files, and apply command. Use this as the
+  summary with ok/run_status, patch status, and apply command. Use this as the
   normal GPT implementation path for Trellis tasks.
 effort: xhigh
 tools: mcp__executor-adapter__dispatch, mcp__executor-adapter__preview_prompt, mcp__executor-adapter__read_report, mcp__executor-adapter__smoke, Read, Grep, Glob, Bash
@@ -56,13 +56,14 @@ main orchestrator context. Dispatch only when the task is ready and bounded.
 
 ### 4. Report back
 
-- Read the structured MCP result first; treat `result_class`, `status_reason`,
-  `changed_files`, `apply_command`, and validation fields as authoritative.
-  Use `mcp__executor-adapter__read_report` only when a report summary or log tail is
-  needed to explain a blocker.
-- Return a short, operational summary to the main session: `result_class`,
-  `status_reason`, changed files, `apply_command` when present, validation
-  outcome, and any blocker or required orchestrator action.
+- Read the structured MCP result first; treat `ok`, `run_status`, `patch`
+  (`status`, `changed_files`, `error`), `apply_command`, and `post_validation`
+  as authoritative. Use `mcp__executor-adapter__read_report` only when a report
+  summary or log tail is needed to explain a blocker.
+- Return a short, operational summary to the main session: `ok`, `run_status`,
+  `patch.status`, changed files, `apply_command` when present, post-validation
+  outcome, and any blocker or required orchestrator action. A non-null
+  top-level `error` field (with `stage` + `message`) explains why `ok=false`.
 - Do not paste the full log or full diff into the main session.
 
 ## Hard Constraints
@@ -74,6 +75,7 @@ main orchestrator context. Dispatch only when the task is ready and bounded.
   this agent's default responsibilities.
 - The orchestrator main session owns patch application, validation sequencing,
   independent review, and commits.
-- Do not trust executor exit code 0 without checking the auto-validation
-  result.
+- Do not trust executor exit code 0 without checking the v2 report: `ok` is the
+  single success signal (`isError = !ok`), driven by `run_status`, `patch`, and
+  `post_validation` together.
 - If auto-validation fails, report the failure as a blocker or follow-up need.

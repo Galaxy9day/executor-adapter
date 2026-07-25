@@ -18,10 +18,10 @@ Recommended: Trellis ≥ 0.6.0 (tested against 0.6.9). Channel audit messages re
 - Defaults implementation/custom dispatches to **Codex CLI** in an isolated git worktree under `.trellis/.runtime/pi-workers/<worker-id>/`, then exports `diff.patch` and `report.json` for the orchestrator to review/apply.
 - Keeps **Pi** available as an opt-in provider-routing backend for cross-model review or non-OpenAI implementation experiments.
 - Spawns the selected executor with a sanitised environment (credential-shaped vars are stripped before inheritance).
-- Classifies patch-ready limited-validation runs distinctly from true blockers, so orchestrators can continue main-repo validation without reading the full executor log.
+- Reports a v2 orthogonal fact model (`ok` / `run_status` / `patch` / `post_validation`) so the orchestrator can route outcomes from structured fields instead of parsing executor prose; `ok` is the single success signal (`isError = !ok`).
 - Defaults adapter `check` dispatches to read-only Pi review mode (`read,bash,grep,find,ls`) so Pi can supplement quality review without mutating the repo.
 - In channel mode: emits best-effort bookend audit messages into the Trellis channel via `@mindfoldhq/trellis-core`'s `sendMessage`.
-- Runs post-execution validation against `git diff` (`min_files_changed`, `required_paths_modified`, `forbidden_paths`, `min_diff_lines`) — catches "exit 0 + no useful work" failures before the orchestrator sees them.
+- Runs post-execution validation against `git diff` (`min_files_changed`, `required_paths_modified`, `forbidden_paths`, `min_diff_lines`) — catches "exit 0 + no useful work" failures before the orchestrator sees them. (Skipped in review mode.)
 - Resolves executor model names from `~/.pi/config.toml` so you never hard-code provider routes into scripts.
 
 ## Install
@@ -102,7 +102,7 @@ Two backends share the same dispatch pipeline (worktree isolation, diff export, 
 | Binary | `pi` (`PI_BINARY` override) | `codex` (`CODEX_BINARY` override) |
 | Model source | `[executor_adapter]` logical names or full route | `[executor_adapter.codex]`, explicit `model`, or the codex CLI default |
 | Isolation (`isolate_executor=true`) | per-worker `PI_CODING_AGENT_DIR` + `--no-extensions/--no-skills/...` | `--ignore-rules --ephemeral`; user config is still loaded for provider/auth settings |
-| Tool restriction | `--tools` list from the `tools` param | OS sandbox: `--sandbox read-only` (review/patch) or `workspace-write` (worktree/direct) |
+| Tool restriction | `--tools` list from the `tools` param | OS sandbox: `--sandbox read-only` (review) or `workspace-write` (worktree/direct) |
 | Auth | `PI_*` / `NEWAPI_*` env preserved | local `$CODEX_HOME/config.toml` + `$CODEX_HOME/auth.json`; API keys are never forwarded |
 | Output | plain text log | `--json` JSONL events; token `usage` lands in report.json |
 
@@ -124,10 +124,10 @@ Assemble context, run the selected executor, optionally emit channel events, run
 | `executor` | `pi` \| `codex` | Executor backend. Defaults: `default_executor` config, else `implement/custom→codex`, `check→pi`. |
 | `model` | string | Logical name (`implementer` / `reviewer` / custom key; `[executor_adapter.codex]` for codex) or fully qualified route/model name. For Codex, omit it to use `$CODEX_HOME/config.toml`; never use `model="codex"`. |
 | `thinking` | string | Reasoning effort. Default `xhigh` (`--thinking` for pi, `model_reasoning_effort` for codex). |
-| `execution_mode` | string | `review`, `patch`, `worktree`, or `direct`. Defaults to `worktree` for `implement/custom`, `review` for `check`. |
-| `isolate_executor` / `isolate_pi` | boolean | Default `true`. `isolate_executor` is the preferred name; `isolate_pi` remains as a compatibility alias. Pi: disables extensions/skills/prompt templates/context files/session persistence and uses a per-worker Pi home. Codex: `--ignore-rules --ephemeral` while still loading user config for provider/auth settings. |
+| `execution_mode` | string | `review`, `worktree`, or `direct`. Defaults to `worktree` for `implement/custom`, `review` for `check`. |
+| `isolate_executor` | boolean | Default `true`. Pi: disables extensions/skills/prompt templates/context files/session persistence and uses a per-worker Pi home. Codex: `--ignore-rules --ephemeral` while still loading user config for provider/auth settings. |
 | `embed_context` | boolean | Default `true`: inline Trellis manifest/task artifact contents. When `false`, only list paths for the executor to read on demand. |
-| `tools` | string | Comma-separated tool list (pi executor only; codex restricts via `--sandbox`). Defaults by `execution_mode`: `review=read,bash,grep,find,ls`, `patch=read,bash,grep,find,ls`, `worktree/direct=read,bash,edit,write,grep,find,ls`. |
+| `tools` | string | Comma-separated tool list (pi executor only; codex restricts via `--sandbox`). Defaults by `execution_mode`: `review=read,bash,grep,find,ls`, `worktree/direct=read,bash,edit,write,grep,find,ls`. |
 | `timeout_minutes` | number | Default 60, hard-capped at 120. |
 | `dry_run` | boolean | Build prompt without launching the executor. |
 | `extra_instructions` | string | Additional prompt text appended after assembled context. |
@@ -144,50 +144,54 @@ Assemble context, run the selected executor, optionally emit channel events, run
 
 #### Execution modes
 
-- `worktree` (default for implementation): creates `.trellis/.runtime/pi-workers/<worker-id>/repo` from `HEAD`, runs the executor there, writes `output.log`, `report.json`, and `diff.patch`, and returns an `apply_command` (`git apply "<patch>"`). The main repository is not modified by the executor.
+- `worktree` (default for implementation): creates `.trellis/.runtime/pi-workers/<worker-id>/repo` from `HEAD`, runs the executor there, writes `output.log`, `report.json`, and `diff.patch`, and returns an `apply_command` (`git apply "<patch>"`) when the patch is non-empty. The main repository is not modified by the executor.
 - `review` (default for check): runs read-only and reports findings. Codex uses `--sandbox read-only`; Pi uses `read,bash,grep,find,ls` (the prompt restricts bash to read-only use — no writes/staging/commits/push). The adapter also embeds `git diff <base>` into the prompt and copies the executor's verdict into `report.json` as `review_summary`. Use this for cross-model review.
-- `patch`: asks the executor to produce a unified diff in its final answer without direct edits.
 - `direct`: legacy in-place execution in the target repository. Use only when the orchestrator explicitly wants executor writes in the main repo and the environment supports it.
 
 `worktree` prompts embed Trellis manifest files and task artifacts so the executor can run from a clean checkout even when task files are uncommitted in the main worktree. If the assembled prompt exceeds 80 KB, Pi dispatches print a warning because very large prompts can destabilize Pi's isolated-mode SSE client. Use a curated `implement.jsonl` or `embed_context=false` when the executor can read the files directly from the worktree.
 
-#### Result classes and report fields
+#### Report model (v2)
 
-`report.json` and the MCP return include short structured fields for the orchestrator:
+`report.json` and the MCP return use an orthogonal fact model. `ok` is the single success signal (`isError = !ok`); the other fields are independent facts:
 
 ```json
 {
-  "status": "patch_ready_limited_validation",
-  "result_class": "patch_ready_limited_validation",
-  "status_reason": "The executor produced a non-empty patch and static/auto validation passed, but data validation was not available in the isolated worktree.",
-  "validation_scope": "static/auto validation passed; data validation must run in main repo",
-  "data_validation": "not_attempted",
-  "data_validation_reason": "Derived/generated data was unavailable in the isolated worker; run data validation in the main repository after applying the patch.",
+  "schema": "executor-adapter.report.v2",
+  "ok": true,
+  "run_status": "done",
+  "execution_mode": "worktree",
   "project_mode": "trellis_local_worktree",
+  "exit_code": 0,
+  "signal": null,
+  "usage": { "input_tokens": 120, "output_tokens": 30 },
+  "patch": {
+    "status": "ready",
+    "file": "/path/to/diff.patch",
+    "changed_files": ["src/feature.ts"],
+    "error": null
+  },
+  "post_validation": {
+    "status": "passed",
+    "failures": [],
+    "checks": ["min_files_changed", "required_paths_modified"]
+  },
   "apply_command": "git apply \"/path/to/diff.patch\"",
-  "orchestrator_next_steps": [
-    "Inspect report.json and diff.patch",
-    "Apply patch: git apply \"/path/to/diff.patch\"",
-    "Run cheap validation",
-    "Run sample/small validation",
-    "Run independent check/trellis-check",
-    "If check changes code, re-run sample/small validation",
-    "Run expensive full validation",
-    "Commit only from the orchestrator after validation passes"
-  ],
-  "recommended_main_repo_commands": [
-    "git apply \"/path/to/diff.patch\"",
-    "git status --short",
-    "git diff --stat"
-  ]
+  "requested_validation_commands": ["npm test"],
+  "error": null,
+  "worker_id": "codex-implement-...",
+  "worker_repo": "/path/to/worktree/repo",
+  "prompt_file": "...", "log_file": "...", "report_file": "...",
+  "finished_at": "2026-07-25T..."
 }
 ```
 
-`blocked` is reserved for runs where the executor cannot continue and no apply-ready patch is available. When the executor exits 0 with a non-empty patch and post-validation passes, but isolated worktree data validation is unavailable, the adapter returns `patch_ready_limited_validation` instead of `blocked`.
+- **`run_status`**: `done` | `failed` | `timeout` | `killed` | `spawn_error` | `setup_failed`. Timeout (our kill) takes precedence over signal; `failed` covers non-zero exit **or** an executor-native structured failure (Codex `turn.failed` / `error` JSONL events) — the natural-language approval-scanning heuristic was removed.
+- **`patch.status`**: `ready` (non-empty worktree patch) | `none` (no changes) | `export_failed` (diff export errored) | `not_applicable` (direct/review). Always present.
+- **`post_validation.status`**: `passed` | `failed` | `skipped`. Review mode is always `skipped`, even when check params are supplied. `checks` lists the actually-configured check names.
+- **`error`**: top-level structured `{ stage, message }`, present on every report (`null` when `ok=true`). Stages: `worktree_setup`, `spawn`, `timeout`, `killed`, `executor`, `post_validation`, `patch`, `patch_export`. `patch.error` is the source of truth for diff-export errors only.
+- **`ok`** derivation: non-worktree `ok = run_status==='done' && post_validation.status!=='failed'`; worktree adds `&& patch.status==='ready'`. `isError = !ok`.
 
-In `review` mode the result is classified independently of patch/worktree post-conditions: exit 0 yields `status: "done"` / `result_class: "review_completed"` / `status_reason: "Read-only review finished successfully."`, regardless of wording in the report — so normal review prose like "cannot / approval / required" is no longer misread as a blocker. `changed_files`, `min_diff_lines`, `required_paths_modified`, `forbidden_paths`, and `usablePatch` are not applied to review runs, and `data_validation` is `not_applicable`. The executor's verdict is also written to `report.json` as `review_summary` (tail of the captured output, capped at 4000 chars) so callers can read it without paging through `output.log`; `read_report` prints its first 800 chars. Review `orchestrator_next_steps` point at the findings and an optional follow-up implement dispatch, never at patch apply or full validation.
-
-The dispatch response intentionally does not inline long stdout/stderr. It returns summary fields and artifact paths; use `read_report` when you need the log tail.
+`apply_command` is non-null only for `worktree` + `patch.status==='ready'`. The dispatch response intentionally does not inline long stdout/stderr; use `read_report` for the log tail.
 
 `project_mode` is one of `trellis_channel_bridge`, `trellis_local_worktree`, `standalone_worktree`, or `standalone`.
 
@@ -201,7 +205,7 @@ One-shot connectivity test. Verifies the executor binary is on PATH and the reso
 
 ### `read_report({ log_file?, report_file?, runtime_dir?, worker_id?, lines? })`
 
-Reads `report.json` when available and prints a short summary first: `result_class`, `project_mode`, `changed_files`, `apply_command`, next steps, and recommended commands. It can resolve both Trellis runtime directories (`.trellis/.runtime/pi-workers/<worker-id>/`) and standalone runtime directories (`/tmp/executor-adapter/pi-workers/<worker-id>/`). Log tail output remains available via `lines`.
+Reads `report.json` when available and prints a short summary first: `ok`, `run_status`, `patch.status`, `post_validation.status`, `project_mode`, `changed_files`, and `apply_command`. It can resolve both Trellis runtime directories (`.trellis/.runtime/pi-workers/<worker-id>/`) and standalone runtime directories (`/tmp/executor-adapter/pi-workers/<worker-id>/`), and any explicit `runtime_dir`/`report_file`/`log_file` path. Log tail output remains available via `lines`.
 
 ### `cleanup_runtime({ working_directory?, retain_days?, dry_run? })`
 
@@ -214,8 +218,8 @@ When `dispatch` detects `TRELLIS_CHANNEL` / `TRELLIS_CHANNEL_NAME` env var (or a
 1. **Keeps its own local dispatch lock.** A channel message does not make the executor a native Trellis worker; Trellis `worker_guard` does not own this subprocess lifecycle.
 2. **Emits bookend audit messages** via `@mindfoldhq/trellis-core/channel`'s `sendMessage`:
    - text `executor-adapter: dispatch_start` when the executor spawns
-   - text `executor-adapter: dispatch_done` / `dispatch_failed` / `spawn_error` on exit
-   - structured `meta` includes `schema: "executor-adapter.dispatch.v1"`, `event` (the bookend name — trellis-core 0.6.x dropped the `tag` option), exit code, validation status, changed files, report/log/patch paths
+   - text `executor-adapter: dispatch_done` / `dispatch_failed` on exit; `setup_failed` / `spawn_error` for terminal pre-run failures
+   - structured `meta` includes `schema: "executor-adapter.dispatch.v2"`, `event` (the bookend name — trellis-core 0.6.x dropped the `tag` option), and the core v2 facts: `ok`, `run_status`, `patch_status`, `post_validation_status`, exit code, report/log/patch paths
    - a stable `idempotencyKey` (`executor-adapter:<worker_id>:<event>`) so retries don't double-append — trellis-core 0.6.x `appendEvent` dedups on `idempotencyKey` + `kind`
    - `task` is sent as a workDir-relative path (resolved from absolute / symlinked task dirs) so a channel reader on another checkout can locate it
 3. **Three-tier fallback**: if `@mindfoldhq/trellis-core` is unavailable, falls back to official `trellis channel send --as executor-adapter --stdin` CLI shape (async); if that's also missing, drops the event with a stderr note. Dispatch never blocks on channel emission.
@@ -272,7 +276,7 @@ Designed to keep working through Trellis version upgrades:
 
 - `@mindfoldhq/trellis-core/channel` is loaded via dynamic `import()` in `try/catch` — a missing or breaking-changed package degrades to CLI fallback, not module-load failure.
 - Two env var aliases (`TRELLIS_CHANNEL`, `TRELLIS_CHANNEL_NAME`) are checked, so a future Trellis rename keeps working.
-- `[pi_adapter]` and `[trellis_pi_adapter]` TOML sections are read as legacy aliases for `[executor_adapter]` (with a one-shot stderr nudge to migrate).
+- `[pi_adapter]` and `[trellis_pi_adapter]` TOML sections are **no longer read** (0.11.0 breaking change): discovery of a legacy section emits a `CONFIG ERROR` to stderr and the section is ignored. Rename to `[executor_adapter]`. (`read_report(runtime_dir)` still accepts any explicit directory path.)
 - No hard-coded paths — runtime dir resolves per-OS via `os.tmpdir()`; binaries can be overridden via `PI_BINARY` / `CODEX_BINARY` env.
 
 ## Environment

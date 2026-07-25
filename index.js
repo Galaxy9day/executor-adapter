@@ -40,18 +40,24 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { EXECUTORS, resolveExecutor } from './executors.js';
+import {
+  REPORT_SCHEMA,
+  buildPostValidation,
+  buildPatch,
+  computeOk,
+  resolveRunStatus,
+  buildDispatchError,
+} from './report-v2.js';
 
 // ---- Constants ----
 
 const SERVER_NAME = 'executor-adapter';
-const LEGACY_SERVER_NAMES = ['pi-adapter'];
-const SERVER_VERSION = '0.10.3';  // keep in sync with package.json
+const SERVER_VERSION = '0.11.0';  // keep in sync with package.json
 const TMP_RUNTIME_DIR = path.join(os.tmpdir(), SERVER_NAME);
 const CHANNEL_ENV_ALIASES = ['TRELLIS_CHANNEL', 'TRELLIS_CHANNEL_NAME'];
 const TRELLIS_BIN_ENV = 'TRELLIS_BINARY';
 const DEFAULT_WRITE_TOOLS = 'read,bash,edit,write,grep,find,ls';
 const DEFAULT_READ_TOOLS = 'read,bash,grep,find,ls';
-const DEFAULT_PATCH_TOOLS = 'read,bash,grep,find,ls';
 const PROMPT_SIZE_WARN_BYTES = 80 * 1024;
 
 // ---- Small utilities ----
@@ -87,11 +93,6 @@ function resolveRuntimeDir(workDir) {
     return path.join(workDir, '.trellis', '.runtime');
   }
   return TMP_RUNTIME_DIR;
-}
-
-function legacyRuntimeDirs(workDir) {
-  if (fs.existsSync(path.join(workDir, '.trellis'))) return [];
-  return LEGACY_SERVER_NAMES.map(name => path.join(os.tmpdir(), name));
 }
 
 function detectProjectMode(workDir, channelName, executionMode) {
@@ -169,7 +170,7 @@ async function emitChannelEvent(channelName, eventName, payload, workDir) {
   // meta carries the event name (trellis-core 0.6.x dropped the sendMessage
   // `tag` option) plus a workDir-relative task path so a channel reader on
   // another host or a symlinked checkout can resolve it.
-  const meta = { schema: 'executor-adapter.dispatch.v1', legacy_schema: 'pi-adapter.dispatch.v1', event: eventName, ...payload };
+  const meta = { schema: 'executor-adapter.dispatch.v2', event: eventName, ...payload };
   if (meta.task && workDir && path.isAbsolute(String(meta.task))) {
     const rel = path.relative(workDir, String(meta.task));
     if (rel && !rel.startsWith('..')) meta.task = rel;
@@ -480,8 +481,6 @@ function buildDispatchPrompt(args) {
   if (extraInstructions)      p += `\n## Additional Instructions\n\n${extraInstructions}\n\n`;
   if (executionMode === 'worktree') {
     p += `\n## Execution Environment\n\nYou are running inside an isolated git worktree. Modify files there normally. The orchestrator will export your changes as a patch, review it, and decide whether to apply it to the main repository. Do not commit.\n\n`;
-  } else if (executionMode === 'patch') {
-    p += `\n## Execution Environment\n\nDo not edit files directly. Produce a unified diff in your final answer that the orchestrator can review and apply.\n\n`;
   } else if (executionMode === 'review') {
     p += `\n## Execution Environment\n\nRead-only review mode. Do not modify, write, stage, commit, or push anything; run only read-only inspections such as \`git diff\`, \`git log\`, \`grep\`, or \`cat\`. Report findings and recommended fixes only.\n`;
     if (reviewDiff) {
@@ -512,8 +511,6 @@ function buildNoTrellisPrompt(mode, extraInstructions, scope, validationCommands
   if (scope) p += `## Scope Constraint\n\n${scope}\n\n`;
   if (executionMode === 'worktree') {
     p += `## Execution Environment\n\nYou are running inside an isolated git worktree. Modify files there normally. The orchestrator will export your changes as a patch, review it, and decide whether to apply it to the main repository. Do not commit.\n\n`;
-  } else if (executionMode === 'patch') {
-    p += `## Execution Environment\n\nDo not edit files directly. Produce a unified diff in your final answer that the orchestrator can review and apply.\n\n`;
   } else if (executionMode === 'review') {
     p += `## Execution Environment\n\nRead-only review mode. Do not modify, write, stage, commit, or push anything; run only read-only inspections such as \`git diff\`, \`git log\`, \`grep\`, or \`cat\`. Report findings and recommended fixes only.\n`;
     if (reviewDiff) {
@@ -619,14 +616,12 @@ function makeHeadTailBuffer(headCap = 10 * 1024, tailCap = 40 * 1024) {
       }
     },
     snapshot: render,
-    finalize: render,
   };
 }
 
 function snapshotBuffer(buf) {
   if (!buf) return '';
   if (typeof buf.snapshot === 'function') return buf.snapshot();
-  if (typeof buf.finalize === 'function') return buf.finalize();
   return '';
 }
 
@@ -661,7 +656,6 @@ function defaultExecutionMode(mode) {
 
 function defaultToolsForExecution(executionMode) {
   if (executionMode === 'review') return DEFAULT_READ_TOOLS;
-  if (executionMode === 'patch') return DEFAULT_PATCH_TOOLS;
   return DEFAULT_WRITE_TOOLS;
 }
 
@@ -767,11 +761,6 @@ function prepareWorkerDiff(repoDir, patchFile) {
   return { ok: true, changedFiles, shortstat, patchFile, bytes: Buffer.byteLength(patch) };
 }
 
-function hasUsablePatch(executionMode, diffInfo, changedFiles) {
-  if (executionMode !== 'worktree') return false;
-  return Boolean(diffInfo && diffInfo.ok && Array.isArray(changedFiles) && changedFiles.length > 0);
-}
-
 // Best-effort diff capture for read-only review. Review runs in the main repo,
 // so surface what changed vs `base` so the reviewer does not have to guess the
 // diff. Any failure (missing ref, non-repo) is silent — the prompt still works.
@@ -798,223 +787,12 @@ function captureReviewDiff(workDir, base) {
   return { ref, stat, snippet };
 }
 
-function detectsDataValidationUnavailable(output) {
-  const text = output || '';
-  return [
-    /(derived|generated|sample|full|fixture|data).{0,100}(missing|unavailable|not available|not found|cannot|can't|unable|skipped|not attempted)/i,
-    /(cannot|can't|unable|skipped|not attempted).{0,100}(sample|full|data|validation|derived|generated)/i,
-    /data validation.{0,100}(must|needs?).{0,60}main repo/i,
-  ].some((re) => re.test(text));
-}
-
-function validationScopeText(validation, limitedDataValidation) {
-  if (!validation || validation.skipped) {
-    return limitedDataValidation
-      ? 'auto validation skipped; data validation must run in main repo'
-      : 'auto validation skipped; orchestrator validation required';
-  }
-  if (validation.passed) {
-    return limitedDataValidation
-      ? 'static/auto validation passed; data validation must run in main repo'
-      : 'static/auto validation passed; orchestrator validation required';
-  }
-  return 'auto validation failed';
-}
-
-function classifyResult({ executionMode, status, finalStatus, exitCode, validation, diffInfo, changedFiles, output }) {
-  // Read-only review is success-oriented: finalStatus 'done' means the review
-  // ran to completion, regardless of patch/worktree post-conditions — nothing
-  // is supposed to change. This sidesteps approvalBlocked misfiring on normal
-  // review prose and skips patch-only checks (changed_files, min_diff_lines,
-  // usablePatch, validation.passed) that do not apply to a read-only run.
-  if (executionMode === 'review') {
-    if (finalStatus === 'done') {
-      return {
-        status: 'done',
-        result_class: 'review_completed',
-        status_reason: 'Read-only review finished successfully.',
-        data_validation: 'not_applicable',
-        data_validation_reason: 'Review mode does not modify files; data validation is not applicable.',
-      };
-    }
-    return {
-      status: finalStatus,
-      result_class: finalStatus === 'blocked' ? 'blocked' : 'failed',
-      status_reason: finalStatus === 'blocked'
-        ? 'The review executor hit an approval/permission blocker.'
-        : 'The review executor did not complete successfully.',
-      data_validation: 'not_applicable',
-      data_validation_reason: 'Review mode does not modify files.',
-    };
-  }
-
-  const usablePatch = hasUsablePatch(executionMode, diffInfo, changedFiles);
-  const limitedDataValidation = usablePatch && validation?.passed && exitCode === 0 && detectsDataValidationUnavailable(output);
-
-  if (limitedDataValidation && (status === 'done' || status === 'blocked')) {
-    return {
-      status: 'patch_ready_limited_validation',
-      result_class: 'patch_ready_limited_validation',
-      status_reason: 'The executor produced a non-empty patch and static/auto validation passed, but data validation was not available in the isolated worktree.',
-      data_validation: 'not_attempted',
-      data_validation_reason: 'Derived/generated data was unavailable in the isolated worker; run data validation in the main repository after applying the patch.',
-    };
-  }
-
-  if (executionMode === 'worktree' && diffInfo?.ok && changedFiles.length === 0) {
-    return {
-      status: 'no_patch',
-      result_class: 'no_usable_patch',
-      status_reason: 'The executor exited without producing changes in diff.patch.',
-      data_validation: 'not_attempted',
-      data_validation_reason: 'No patch was produced, so main-repository data validation is not applicable yet.',
-    };
-  }
-
-  if (!validation?.passed) {
-    return {
-      status: 'validation_failed',
-      result_class: 'validation_failed',
-      status_reason: 'Post-execution validation failed.',
-      data_validation: 'not_attempted',
-      data_validation_reason: 'Main-repository data validation should wait until post-validation failures are resolved.',
-    };
-  }
-
-  if (executionMode === 'worktree' && usablePatch && finalStatus === 'done') {
-    return {
-      status: 'done',
-      result_class: 'patch_ready',
-      status_reason: 'The executor produced a non-empty patch and post-validation passed.',
-      data_validation: 'not_attempted',
-      data_validation_reason: 'Worktree dispatch does not prove main-repository data validation; run it after applying the patch.',
-    };
-  }
-
-  if (finalStatus === 'done') {
-    return {
-      status: 'done',
-      result_class: 'completed',
-      status_reason: 'The executor completed and post-validation passed.',
-      data_validation: 'not_attempted',
-      data_validation_reason: 'No adapter-level data validation result was captured.',
-    };
-  }
-
-  return {
-    status: finalStatus,
-    result_class: finalStatus === 'blocked' ? 'blocked' : 'failed',
-    status_reason: finalStatus === 'blocked'
-      ? 'The executor could not continue and did not produce an apply-ready patch.'
-      : 'The executor did not complete successfully.',
-    data_validation: 'not_attempted',
-    data_validation_reason: 'Main-repository data validation should wait until dispatch succeeds.',
-  };
-}
-
 function extractReviewSummary(output, cap = 4000) {
   const text = String(output || '').trim();
   if (!text) return '';
   // Review verdicts/findings live at the tail; cap to keep report.json small.
   // The full executor output always remains available in output.log.
   return text.length > cap ? text.slice(-cap) : text;
-}
-
-// ---- v2 orthogonal outcome model (replaces result_class + data_validation state machine) ----
-// The adapter reports facts, not workflow opinions. `ok` is the single success
-// signal (isError = !ok); run_status / patch / post_validation are independent.
-
-const POST_VALIDATION_CHECKS = ['min_files_changed', 'required_paths_modified', 'forbidden_paths', 'min_diff_lines'];
-
-function configuredValidationChecks(params) {
-  return POST_VALIDATION_CHECKS.filter((name) => {
-    if (name === 'min_files_changed') return typeof params.min_files_changed === 'number';
-    if (name === 'required_paths_modified') return Array.isArray(params.required_paths_modified) && params.required_paths_modified.length > 0;
-    if (name === 'forbidden_paths') return Array.isArray(params.forbidden_paths) && params.forbidden_paths.length > 0;
-    if (name === 'min_diff_lines') return typeof params.min_diff_lines === 'number';
-    return false;
-  });
-}
-
-function buildPostValidation(executionMode, raw, params) {
-  const checks = configuredValidationChecks(params);
-  if (executionMode === 'review') return { status: 'skipped', failures: [], checks };
-  if (!raw || raw.skipped) return { status: 'skipped', failures: [], checks };
-  return { status: raw.passed ? 'passed' : 'failed', failures: raw.failures || [], checks };
-}
-
-function buildPatch(executionMode, diffInfo, changedFiles, patchPath) {
-  if (executionMode !== 'worktree') {
-    return { status: 'not_applicable', has_patch: false, file: null, changed_files: [], error: null };
-  }
-  if (!diffInfo || !diffInfo.ok) {
-    return { status: 'export_failed', has_patch: false, file: patchPath, changed_files: [], error: (diffInfo && diffInfo.error) || 'diff export failed' };
-  }
-  const changed = Array.isArray(changedFiles) ? changedFiles : [];
-  if (changed.length === 0) return { status: 'none', has_patch: false, file: patchPath, changed_files: [], error: null };
-  return { status: 'ready', has_patch: true, file: patchPath, changed_files: changed, error: null };
-}
-
-// ok: single source of truth for success. isError = !ok. Orthogonal facts only.
-function computeOk(runStatus, patch, postValidation) {
-  if (runStatus !== 'done') return false;
-  if (postValidation.status === 'failed') return false;
-  if (patch.status === 'none' || patch.status === 'export_failed') return false;
-  return true;
-}
-
-function buildOrchestratorNextSteps({ resultClass, projectMode, applyCommand, validationCommands = [], executionMode }) {
-  if (executionMode === 'review') {
-    if (resultClass === 'review_completed') {
-      return [
-        'Inspect report.json and review_summary',
-        'Extract findings and decide next action',
-        'If fixes are needed, dispatch again with mode=implement',
-      ];
-    }
-    return [
-      'Inspect report.json and output.log',
-      'Diagnose why the review executor did not complete',
-      'Re-dispatch once the executor can run to completion',
-    ];
-  }
-  if (resultClass === 'no_usable_patch') {
-    return ['Inspect report/log', 'Tighten scope or instructions', 'Re-dispatch or fix manually'];
-  }
-  if (resultClass === 'validation_failed') {
-    return ['Inspect report/diff', 'Resolve post-validation failures', 'Re-run cheap validation before apply'];
-  }
-  if (resultClass === 'blocked' || resultClass === 'failed') {
-    return ['Inspect report/log', 'Fix the blocker', 'Re-dispatch when the task can continue'];
-  }
-
-  const checkStep = projectMode.startsWith('trellis_')
-    ? 'Run independent check/trellis-check'
-    : 'Run independent review/check';
-  const steps = [
-    'Inspect report.json and diff.patch',
-    applyCommand ? `Apply patch: ${applyCommand}` : 'Apply accepted changes',
-    'Run cheap validation',
-    'Run sample/small validation',
-    checkStep,
-    'If check changes code, re-run sample/small validation',
-    'Run expensive full validation',
-    'Commit only from the orchestrator after validation passes',
-  ];
-  if (validationCommands.length > 0) {
-    steps.splice(3, 0, 'Run requested validation_commands in the main repository');
-  }
-  return steps;
-}
-
-function buildRecommendedCommands({ applyCommand, validationCommands = [] }) {
-  const commands = [];
-  if (applyCommand) commands.push(applyCommand);
-  commands.push('git status --short', 'git diff --stat');
-  for (const cmd of validationCommands) {
-    if (typeof cmd === 'string' && cmd.trim()) commands.push(cmd.trim());
-  }
-  return [...new Set(commands)];
 }
 
 function writeJsonFile(filePath, data) {
@@ -1098,12 +876,8 @@ function runtimeWorkersDir(runtimeDir) {
   return path.join(runtimeDir, 'pi-workers');
 }
 
-function existingRuntimeWorkersDirs(runtimeDir, workDir) {
-  const dirs = [runtimeWorkersDir(runtimeDir)];
-  for (const legacy of legacyRuntimeDirs(workDir)) {
-    dirs.push(runtimeWorkersDir(legacy));
-  }
-  return [...new Set(dirs)];
+function existingRuntimeWorkersDirs(runtimeDir) {
+  return [runtimeWorkersDir(runtimeDir)];
 }
 
 function removeWorkerRuntime(workerDir, workDir) {
@@ -1134,7 +908,6 @@ async function dispatch(args) {
     tools: toolsInput,
     execution_mode: executionModeInput,
     isolate_executor,
-    isolate_pi,
     timeout_minutes: timeoutInput = 60,
     dry_run = false,
     extra_instructions,
@@ -1150,13 +923,13 @@ async function dispatch(args) {
     base = 'main',
   } = args;
 
-  const isolateExecutor = isolate_executor ?? isolate_pi ?? true;
+  const isolateExecutor = isolate_executor ?? true;
   const timeout_minutes = Math.min(timeoutInput, 120);
   const workDir = cwd || process.cwd();
   const executionMode = executionModeInput || defaultExecutionMode(mode);
   const tools = toolsInput || defaultToolsForExecution(executionMode);
-  if (!['review', 'patch', 'worktree', 'direct'].includes(executionMode)) {
-    return { content: [{ type: 'text', text: `Error: unsupported execution_mode "${executionMode}". Use review, patch, worktree, or direct.` }], isError: true };
+  if (!['review', 'worktree', 'direct'].includes(executionMode)) {
+    return { content: [{ type: 'text', text: `Error: unsupported execution_mode "${executionMode}". Use review, worktree, or direct.` }], isError: true };
   }
   if (executionMode === 'worktree' && !isGitRepo(workDir)) {
     return { content: [{ type: 'text', text: `Error: execution_mode=worktree requires a git repository: ${workDir}` }], isError: true };
@@ -1299,27 +1072,48 @@ async function dispatch(args) {
       piWorkDir = worker.repoDir;
     } catch (e) {
       if (lockPath) releaseDispatchLock(lockPath);
-      const message = `${metaResponse}\nError creating isolated git worktree: ${e.message}`;
-      writeJsonFile(reportPath, {
-        worker_id: workerId,
-        status: 'spawn_error',
-        result_class: 'failed',
-        status_reason: 'Could not create isolated git worktree.',
-        validation_scope: 'not run',
-        data_validation: 'not_attempted',
-        data_validation_reason: 'Dispatch did not start.',
-        orchestrator_next_steps: ['Inspect error', 'Fix worktree setup', 'Re-dispatch'],
-        recommended_main_repo_commands: ['git status --short'],
-        project_mode: projectMode,
-        executor,
-        error: e.message,
+      const checkParams = { min_files_changed, required_paths_modified, forbidden_paths, min_diff_lines };
+      const setupReport = {
+        schema: REPORT_SCHEMA,
+        ok: false,
+        run_status: 'setup_failed',
         execution_mode: executionMode,
+        executor,
+        model,
+        model_source: modelFrom,
+        model_key: modelKey,
+        tools,
+        isolate_executor: isolateExecutor,
+        task: taskDir || null,
+        project_mode: projectMode,
+        exit_code: null,
+        signal: null,
+        usage: null,
+        patch: buildPatch(executionMode, null, [], patchPath),
+        post_validation: buildPostValidation(executionMode, null, checkParams),
+        apply_command: null,
+        requested_validation_commands: validation_commands,
+        worker_id: workerId,
+        worker_repo: worker.repoDir,
         prompt_file: promptPath,
         log_file: logPath,
         report_file: reportPath,
-        patch_file: null,
+        error: { stage: 'worktree_setup', message: e.message },
         finished_at: new Date().toISOString(),
-      });
+      };
+      writeJsonFile(reportPath, setupReport);
+      await emitChannelEvent(channelName, 'setup_failed', {
+        mode, task: taskDir, executor,
+        worker_id: workerId, execution_mode: executionMode,
+        ok: false,
+        run_status: 'setup_failed',
+        patch_status: setupReport.patch.status,
+        post_validation_status: setupReport.post_validation.status,
+        error: setupReport.error,
+        report_file: reportPath,
+        finished_at: setupReport.finished_at,
+      }, workDir);
+      const message = `${metaResponse}\nError creating isolated git worktree: ${e.message}`;
       return { content: [{ type: 'text', text: message }], isError: true };
     }
   }
@@ -1400,78 +1194,54 @@ async function dispatch(args) {
         diffInfo = prepareWorkerDiff(worker.repoDir, patchPath);
       }
 
-      const validation = runPostValidation(piWorkDir, {
-        min_files_changed, required_paths_modified, forbidden_paths, min_diff_lines,
-      });
+      const checkParams = { min_files_changed, required_paths_modified, forbidden_paths, min_diff_lines };
+      const rawValidation = runPostValidation(piWorkDir, checkParams);
 
-      const stdout = stdoutBuf.finalize();
-      const stderr = stderrBuf.finalize();
+      const stdout = stdoutBuf.snapshot();
+      const stderr = stderrBuf.snapshot();
       const interp = exec.interpretOutput({ exitCode, killed, stdout, stderr, worker });
       let output = interp.output;
       if (killed) output += `\n\n[PROCESS KILLED: exceeded ${timeout_minutes} minute timeout]`;
       if (signaled && !killed) output += `\n\n[PROCESS EXITED BY SIGNAL: ${signal}]`;
 
-      const runStatus = signaled ? 'killed' : interp.runStatus;
-      const changedFiles = validation.changedFiles || diffInfo?.changedFiles || [];
-      const ok = runStatus === 'done' && validation.passed && (!diffInfo || diffInfo.ok) && !(executionMode === 'worktree' && diffInfo?.ok && changedFiles.length === 0);
-      const finalStatus = ok
-        ? 'done'
-        : (!validation.passed ? 'validation_failed' : (diffInfo && !diffInfo.ok ? 'diff_failed' : runStatus));
-      const result = classifyResult({
-        executionMode,
-        status: runStatus,
-        finalStatus,
-        exitCode,
-        validation,
-        diffInfo,
-        changedFiles,
-        output,
-      });
-      const applyCommand = executionMode === 'worktree' ? `git apply "${patchPath}"` : null;
-      const recommendedCommands = buildRecommendedCommands({ applyCommand, validationCommands: validation_commands });
-      const orchestratorNextSteps = buildOrchestratorNextSteps({
-        resultClass: result.result_class,
-        projectMode,
-        applyCommand,
-        validationCommands: validation_commands,
-        executionMode,
-      });
+      // run_status precedence (v2.1): our timeout kill → timeout; other signal
+      // → killed; otherwise the interpreter's done/failed from exit code +
+      // executor-native structured failure (codex turn.failed/error).
+      const runStatus = resolveRunStatus({ killed, signaled, interpRunStatus: interp.runStatus });
+
+      const changedFiles = rawValidation.changedFiles || diffInfo?.changedFiles || [];
+      const patch = buildPatch(executionMode, diffInfo, changedFiles, patchPath);
+      const postValidation = buildPostValidation(executionMode, rawValidation, checkParams);
+      const ok = computeOk(runStatus, patch, postValidation);
+      const applyCommand = (executionMode === 'worktree' && patch.status === 'ready') ? `git apply "${patchPath}"` : null;
+      const error = buildDispatchError({ runStatus, patch, postValidation, interpError: interp.error, exitCode, signal, timeoutMinutes: timeout_minutes });
+
       const report = {
-        worker_id: workerId,
-        status: result.status,
+        schema: REPORT_SCHEMA,
+        ok,
         run_status: runStatus,
-        result_class: result.result_class,
-        status_reason: result.status_reason,
-        validation_scope: validationScopeText(validation, result.result_class === 'patch_ready_limited_validation'),
-        data_validation: result.data_validation,
-        data_validation_reason: result.data_validation_reason,
-        orchestrator_next_steps: orchestratorNextSteps,
-        recommended_main_repo_commands: recommendedCommands,
-        project_mode: projectMode,
         execution_mode: executionMode,
-        task: taskDir || null,
         executor,
         model,
         model_source: modelFrom,
         model_key: modelKey,
         tools,
         isolate_executor: isolateExecutor,
-        isolate_pi: isolateExecutor,
-        usage: interp.usage || null,
+        task: taskDir || null,
+        project_mode: projectMode,
         exit_code: exitCode,
         signal: signal || null,
-        killed: killed || signaled,
-        validation: validation.skipped ? 'skipped' : (validation.passed ? 'passed' : 'failed'),
-        validation_failures: validation.failures || [],
-        changed_files: changedFiles,
-        shortstat: validation.shortstat || diffInfo?.shortstat || '',
+        usage: interp.usage || null,
+        patch,
+        post_validation: postValidation,
+        apply_command: applyCommand,
+        requested_validation_commands: validation_commands,
+        worker_id: workerId,
+        worker_repo: executionMode === 'worktree' ? worker.repoDir : null,
         prompt_file: promptPath,
         log_file: logPath,
         report_file: reportPath,
-        patch_file: executionMode === 'worktree' ? patchPath : null,
-        apply_command: applyCommand,
-        worker_repo: executionMode === 'worktree' ? worker.repoDir : null,
-        diff: diffInfo,
+        error,
         ...(executionMode === 'review' ? { review_summary: extractReviewSummary(output) } : {}),
         finished_at: new Date().toISOString(),
       };
@@ -1480,44 +1250,44 @@ async function dispatch(args) {
       await emitChannelEvent(channelName, ok ? 'dispatch_done' : 'dispatch_failed', {
         mode, task: taskDir, executor,
         worker_id: workerId, execution_mode: executionMode,
-        status: report.status,
-        result_class: report.result_class,
-        status_reason: report.status_reason,
-        validation_scope: report.validation_scope,
-        exit_code: exitCode, signal: signal || null, killed: killed || signaled,
-        validation: report.validation,
-        validation_failures: validation.failures || [],
-        changed_files: changedFiles,
+        ok,
+        run_status: runStatus,
+        patch_status: patch.status,
+        post_validation_status: postValidation.status,
+        exit_code: exitCode, signal: signal || null,
         report_file: reportPath,
-        patch_file: report.patch_file,
-        apply_command: report.apply_command,
+        patch_file: patch.file,
+        apply_command: applyCommand,
         finished_at: report.finished_at,
       }, workDir);
 
-      let validationBlock = '';
-      if (!validation.skipped) {
-        validationBlock = `\n--- post-validation ---\nstatus: ${validation.passed ? 'passed' : 'FAILED'}\n`;
-        if (validation.shortstat) validationBlock += `git: ${validation.shortstat}\n`;
-        if (validation.changedFiles && validation.changedFiles.length > 0) {
-          validationBlock += `changed files (${validation.changedFiles.length}):\n`;
-          for (const f of validation.changedFiles.slice(0, 30)) validationBlock += `  ${f}\n`;
-          if (validation.changedFiles.length > 30) validationBlock += `  ... +${validation.changedFiles.length - 30} more\n`;
+      let patchBlock = '';
+      if (executionMode === 'worktree') {
+        patchBlock = `\n--- patch ---\nstatus: ${patch.status}\nworker_repo: ${worker.repoDir}\npatch: ${patchPath}\n`;
+        if (patch.status === 'ready' && patch.changed_files.length > 0) {
+          patchBlock += `changed files (${patch.changed_files.length}):\n`;
+          for (const f of patch.changed_files.slice(0, 30)) patchBlock += `  ${f}\n`;
+          if (patch.changed_files.length > 30) patchBlock += `  ... +${patch.changed_files.length - 30} more\n`;
         }
-        if (validation.failures.length > 0) {
+        if (applyCommand) patchBlock += `apply: ${applyCommand}\n`;
+        if (patch.error) patchBlock += `patch_error: ${patch.error}\n`;
+        patchBlock += '\n';
+      }
+      let validationBlock = '';
+      if (postValidation.status !== 'skipped') {
+        validationBlock = `\n--- post-validation ---\nstatus: ${postValidation.status === 'passed' ? 'passed' : 'FAILED'}\n`;
+        if (rawValidation.shortstat) validationBlock += `git: ${rawValidation.shortstat}\n`;
+        if (postValidation.checks.length > 0) validationBlock += `checks: ${postValidation.checks.join(', ')}\n`;
+        if (postValidation.failures.length > 0) {
           validationBlock += `failures:\n`;
-          for (const f of validation.failures) validationBlock += `  - ${f.rule}: ${f.detail}\n`;
+          for (const f of postValidation.failures) validationBlock += `  - ${f.rule}: ${f.detail}\n`;
         }
         validationBlock += '\n';
       }
-      let artifactBlock = `\n--- artifacts ---\nstatus: ${report.status}\nresult_class: ${report.result_class}\nreason: ${report.status_reason}\nvalidation_scope: ${report.validation_scope}\nreport: ${reportPath}\n`;
-      if (executionMode === 'worktree') {
-        artifactBlock += `worker_repo: ${worker.repoDir}\npatch: ${patchPath}\napply: ${report.apply_command}\n`;
-        if (diffInfo && !diffInfo.ok) artifactBlock += `diff_error: ${diffInfo.error}\n`;
-      }
-      if (orchestratorNextSteps.length > 0) {
-        artifactBlock += `next_steps:\n`;
-        for (const step of orchestratorNextSteps) artifactBlock += `  - ${step}\n`;
-      }
+      let artifactBlock = `\n--- artifacts ---\nok: ${ok}\nrun_status: ${runStatus}\n`;
+      if (error) artifactBlock += `error: ${error.stage}: ${error.message}\n`;
+      if (executionMode !== 'worktree') artifactBlock += `patch: ${patch.status}\n`;
+      artifactBlock += `post_validation: ${postValidation.status}\nreport: ${reportPath}\n`;
       const tinyLogDiagnostics = formatTinyLogDiagnostics({
         exec,
         exitCode,
@@ -1527,13 +1297,12 @@ async function dispatch(args) {
         stderr: snapshotBuffer(stderrBuf) || stderr,
       });
 
-      const isError = !['done', 'patch_ready_limited_validation'].includes(report.status);
       finish({
         content: [{
           type: 'text',
-          text: `${metaResponse}\n${exec.label} exited with code ${exitCode}${signal ? ` (signal ${signal})` : ''}.\n${artifactBlock}${validationBlock}${tinyLogDiagnostics}\nOutput captured in: ${logPath}\nUse read_report for the structured summary and optional log tail.`,
+          text: `${metaResponse}\n${exec.label} exited with code ${exitCode}${signal ? ` (signal ${signal})` : ''}.\n${artifactBlock}${patchBlock}${validationBlock}${tinyLogDiagnostics}\nOutput captured in: ${logPath}\nUse read_report for the structured summary and optional log tail.`,
         }],
-        isError,
+        isError: !ok,
       });
     });
 
@@ -1541,33 +1310,46 @@ async function dispatch(args) {
       if (settled) return;
       spawnErrored = true;
       logStream.close();
-      writeJsonFile(reportPath, {
-        worker_id: workerId,
-        status: 'spawn_error',
-        result_class: 'failed',
-        status_reason: `Could not spawn ${exec.label} subprocess.`,
-        validation_scope: 'not run',
-        data_validation: 'not_attempted',
-        data_validation_reason: 'Dispatch did not start.',
-        orchestrator_next_steps: ['Inspect error', `Fix ${exec.name} binary/config`, 'Re-dispatch'],
-        recommended_main_repo_commands: ['git status --short'],
-        project_mode: projectMode,
+      const checkParams = { min_files_changed, required_paths_modified, forbidden_paths, min_diff_lines };
+      const spawnReport = {
+        schema: REPORT_SCHEMA,
+        ok: false,
+        run_status: 'spawn_error',
         execution_mode: executionMode,
-        task: taskDir || null,
         executor,
-        error: err.message,
+        model,
+        model_source: modelFrom,
+        model_key: modelKey,
+        tools,
+        isolate_executor: isolateExecutor,
+        task: taskDir || null,
+        project_mode: projectMode,
+        exit_code: null,
+        signal: null,
+        usage: null,
+        patch: buildPatch(executionMode, null, [], patchPath),
+        post_validation: buildPostValidation(executionMode, null, checkParams),
+        apply_command: null,
+        requested_validation_commands: validation_commands,
+        worker_id: workerId,
+        worker_repo: executionMode === 'worktree' ? worker.repoDir : null,
         prompt_file: promptPath,
         log_file: logPath,
         report_file: reportPath,
-        patch_file: executionMode === 'worktree' ? patchPath : null,
-        worker_repo: executionMode === 'worktree' ? worker.repoDir : null,
+        error: { stage: 'spawn', message: err.message },
         finished_at: new Date().toISOString(),
-      });
+      };
+      writeJsonFile(reportPath, spawnReport);
       await emitChannelEvent(channelName, 'spawn_error', {
         mode, task: taskDir, executor,
         worker_id: workerId, execution_mode: executionMode,
-        error: err.message, report_file: reportPath,
-        finished_at: new Date().toISOString(),
+        ok: false,
+        run_status: 'spawn_error',
+        patch_status: spawnReport.patch.status,
+        post_validation_status: spawnReport.post_validation.status,
+        error: spawnReport.error,
+        report_file: reportPath,
+        finished_at: spawnReport.finished_at,
       }, workDir);
       finish({
         content: [{ type: 'text', text: `${metaResponse}\nError spawning ${exec.name}: ${err.message}` }],
@@ -1692,10 +1474,6 @@ function candidateWorkerDirs(args) {
   if (worker_id) {
     const base = working_directory ? resolveRuntimeDir(resolvePath(working_directory)) : TMP_RUNTIME_DIR;
     dirs.push(path.join(base, 'pi-workers', worker_id));
-    const workDir = working_directory ? resolvePath(working_directory) : process.cwd();
-    for (const legacy of legacyRuntimeDirs(workDir)) {
-      dirs.push(path.join(legacy, 'pi-workers', worker_id));
-    }
   }
   return [...new Set(dirs)];
 }
@@ -1718,18 +1496,25 @@ function resolveReportInputs(args) {
 }
 
 function summarizeReport(report, reportPath) {
-  const changed = Array.isArray(report.changed_files) ? report.changed_files : [];
-  const steps = Array.isArray(report.orchestrator_next_steps) ? report.orchestrator_next_steps : [];
-  const commands = Array.isArray(report.recommended_main_repo_commands) ? report.recommended_main_repo_commands : [];
+  const patch = (report.patch && typeof report.patch === 'object') ? report.patch : null;
+  const postValidation = (report.post_validation && typeof report.post_validation === 'object') ? report.post_validation : null;
+  const changed = (patch && Array.isArray(patch.changed_files)) ? patch.changed_files : [];
   let text = `--- report summary ---\n`;
   text += `report: ${reportPath}\n`;
-  text += `status: ${report.status || '(unknown)'}\n`;
-  text += `result_class: ${report.result_class || '(missing)'}\n`;
+  text += `schema: ${report.schema || '(unknown)'}\n`;
+  text += `ok: ${report.ok === undefined ? '(unknown)' : report.ok}\n`;
+  text += `run_status: ${report.run_status || '(unknown)'}\n`;
   text += `project_mode: ${report.project_mode || '(unknown)'}\n`;
-  if (report.status_reason) text += `status_reason: ${report.status_reason}\n`;
-  if (report.validation_scope) text += `validation_scope: ${report.validation_scope}\n`;
-  if (report.data_validation) text += `data_validation: ${report.data_validation}\n`;
-  if (report.data_validation_reason) text += `data_validation_reason: ${report.data_validation_reason}\n`;
+  if (report.execution_mode) text += `execution_mode: ${report.execution_mode}\n`;
+  if (report.error && typeof report.error === 'object') text += `error: ${report.error.stage || '?'}: ${report.error.message || ''}\n`;
+  if (patch) {
+    text += `patch.status: ${patch.status || '(unknown)'}\n`;
+    if (patch.error) text += `patch.error: ${patch.error}\n`;
+  }
+  if (postValidation) {
+    text += `post_validation.status: ${postValidation.status || '(unknown)'}\n`;
+    if (Array.isArray(postValidation.checks) && postValidation.checks.length > 0) text += `post_validation.checks: ${postValidation.checks.join(', ')}\n`;
+  }
   if (typeof report.review_summary === 'string' && report.review_summary) {
     const snip = report.review_summary.length > 800
       ? `${report.review_summary.slice(0, 800)}\n... (${report.review_summary.length - 800} more chars in report.json)`
@@ -1741,16 +1526,8 @@ function summarizeReport(report, reportPath) {
     text += `changed_files (${changed.length}):\n`;
     for (const f of changed.slice(0, 30)) text += `  ${f}\n`;
     if (changed.length > 30) text += `  ... +${changed.length - 30} more\n`;
-  } else {
+  } else if (patch) {
     text += `changed_files: none\n`;
-  }
-  if (steps.length > 0) {
-    text += `orchestrator_next_steps:\n`;
-    for (const step of steps) text += `  - ${step}\n`;
-  }
-  if (commands.length > 0) {
-    text += `recommended_main_repo_commands:\n`;
-    for (const cmd of commands) text += `  ${cmd}\n`;
   }
   return text;
 }
@@ -1792,7 +1569,7 @@ function cleanupRuntime(args) {
   } = args;
   const workDir = working_directory || process.cwd();
   const runtimeDir = resolveRuntimeDir(workDir);
-  const workersDirs = existingRuntimeWorkersDirs(runtimeDir, workDir);
+  const workersDirs = existingRuntimeWorkersDirs(runtimeDir);
   const retainMs = Math.max(0, Number(retain_days) || 0) * 24 * 60 * 60 * 1000;
   const cutoff = Date.now() - retainMs;
   const existingWorkersDirs = workersDirs.filter(dir => fs.existsSync(dir));
@@ -1898,11 +1675,10 @@ const TOOLS = [
         executor: { type: 'string', enum: ['pi', 'codex'], description: 'Executor backend. Defaults: [executor_adapter] default_executor in ~/.pi/config.toml, else implement/custom→codex, check→pi.' },
         model: { type: 'string', description: 'Logical name (implementer / reviewer / custom key from ~/.pi/config.toml [executor_adapter], or [executor_adapter.codex] for codex) or a fully qualified route/model name. Omit to use the default for the mode (codex falls back to the codex CLI default model). For the Codex backend, use executor="codex"; do not pass model="codex".' },
         thinking: { type: 'string', default: 'xhigh' },
-        execution_mode: { type: 'string', enum: ['review', 'patch', 'worktree', 'direct'], description: 'review=read-only report, patch=final-answer diff, worktree=isolated git worktree + exported diff.patch, direct=legacy in-place execution. Defaults to worktree for implement/custom and review for check.' },
-        isolate_executor: { type: 'boolean', default: true, description: 'Preferred isolation flag. When true, Pi gets --no-extensions/--no-skills/etc. plus a per-worker PI_CODING_AGENT_DIR; codex gets --ignore-rules --ephemeral while still loading user config for provider/auth settings.' },
-        isolate_pi: { type: 'boolean', default: true, description: 'Compatibility name for executor isolation. When true, Pi gets --no-extensions/--no-skills/etc. plus a per-worker PI_CODING_AGENT_DIR; codex gets --ignore-rules --ephemeral while still loading user config for provider/auth settings.' },
+        execution_mode: { type: 'string', enum: ['review', 'worktree', 'direct'], description: 'review=read-only report, worktree=isolated git worktree + exported diff.patch, direct=legacy in-place execution. Defaults to worktree for implement/custom and review for check.' },
+        isolate_executor: { type: 'boolean', default: true, description: 'Isolation flag. When true, Pi gets --no-extensions/--no-skills/etc. plus a per-worker PI_CODING_AGENT_DIR; codex gets --ignore-rules --ephemeral while still loading user config for provider/auth settings.' },
         embed_context: { type: 'boolean', default: true, description: 'When false, Trellis manifest/task artifact contents are not inlined under Embedded Trellis Context; only paths are listed for the executor to read on demand.' },
-        tools: { type: 'string', description: 'Comma-separated Pi tools (pi executor only; codex uses --sandbox mapped from execution_mode). Defaults by execution_mode: review=read,bash,grep,find,ls; patch=read,bash,grep,find,ls; worktree/direct=read,bash,edit,write,grep,find,ls.' },
+        tools: { type: 'string', description: 'Comma-separated Pi tools (pi executor only; codex uses --sandbox mapped from execution_mode). Defaults by execution_mode: review=read,bash,grep,find,ls; worktree/direct=read,bash,edit,write,grep,find,ls.' },
         timeout_minutes: { type: 'number', default: 60, description: 'Capped at 120.' },
         dry_run: { type: 'boolean', default: false, description: 'Build prompt without launching the executor.' },
         extra_instructions: { type: 'string' },
@@ -1928,7 +1704,7 @@ const TOOLS = [
         mode: { type: 'string', enum: ['implement', 'check', 'custom'], default: 'implement' },
         task_dir: { type: 'string' },
         working_directory: { type: 'string' },
-        execution_mode: { type: 'string', enum: ['review', 'patch', 'worktree', 'direct'] },
+        execution_mode: { type: 'string', enum: ['review', 'worktree', 'direct'] },
         extra_instructions: { type: 'string' },
         scope: { type: 'string' },
         context_files: { type: 'array', items: { type: 'string' } },
@@ -1960,7 +1736,7 @@ const TOOLS = [
       properties: {
         log_file: { type: 'string', description: 'Path to executor output log. report.json is read from the same directory when present.' },
         report_file: { type: 'string', description: 'Path to report.json.' },
-        runtime_dir: { type: 'string', description: 'Runtime dir or worker dir. Supports .trellis/.runtime and standalone /tmp/executor-adapter layouts; legacy /tmp/pi-adapter is still readable.' },
+        runtime_dir: { type: 'string', description: 'Runtime dir or worker dir. Supports .trellis/.runtime and standalone /tmp/executor-adapter layouts; any explicit path is read directly.' },
         worker_id: { type: 'string', description: 'Worker id under <runtime_dir>/pi-workers/<worker-id>.' },
         lines: { type: 'number', default: 200 },
         working_directory: { type: 'string' },

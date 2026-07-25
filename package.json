@@ -1,6 +1,6 @@
 {
   "name": "@galaxy9day/executor-adapter",
-  "version": "0.10.3",
+  "version": "0.11.0",
   "description": "Multi-executor MCP (Codex CLI for GPT implementation, Pi CLI for cross-model review) for Trellis-aware and standalone use. Reads Trellis task artifacts, runs the executor in an isolated subprocess/worktree, and can optionally emit non-invasive Trellis channel audit messages.",
   "type": "module",
   "main": "index.js",
@@ -23,6 +23,7 @@
   "files": [
     "index.js",
     "executors.js",
+    "report-v2.js",
     "templates",
     "README.md",
     "LICENSE"

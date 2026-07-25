@@ -60,9 +60,19 @@ if (scenario === 'diff') {
 } else if (scenario === 'review-report') {
   finishTurn('## Findings\n\nThe auth flow cannot land as-is: approval from the owner is required before merge, and two issues were found in the token refresh path.\n\n## Verdict\n\nRequest changes.');
 } else if (scenario === 'turn-failed') {
+  // Executor-native structured failure: emits turn.failed/error events but
+  // exits 0, so the adapter must detect the failure from the JSONL stream,
+  // not from the exit code.
   emit({ type: 'error', message: 'model stream failed' });
   emit({ type: 'turn.failed', error: { message: 'model stream failed' } });
-  process.exit(1);
+  if (lastMessagePath) {
+    try { fs.writeFileSync(lastMessagePath, 'model stream failed\n', 'utf-8'); } catch {}
+  }
+} else if (scenario === 'timeout-sig') {
+  // Simulate an executor that ignores SIGTERM briefly so the adapter's
+  // timeout path engages. Signals are sent by the adapter, not by us.
+  // Just hang until killed.
+  setInterval(() => {}, 1000);
 } else if (scenario === 'smoke-ready') {
   finishTurn('CODEX READY');
 } else if (scenario === 'auth-error') {
